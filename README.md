@@ -105,7 +105,7 @@ sudo cp claude-code-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now claude-code-proxy
 
-# 或 gunicorn（需另外安装：pip install gunicorn）
+# 或 gunicorn
 gunicorn -c gunicorn.conf.py main:app
 ```
 
