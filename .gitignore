@@ -1,0 +1,60 @@
+# ---- 密钥与本地配置 ----
+.env
+.env.*
+!.env.example
+.deploy.env
+.deploy.env.local
+secrets.py
+settings/secrets.py
+*.local
+*.pem
+*.key
+*.p12
+*.crt
+
+# ---- Python 缓存与虚拟环境 ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---- IDE / 操作系统 ----
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---- 日志与运行时产物 ----
+logs/
+*.log
+nohup.out
+proxy.pid
+*.pid
+.backup_*/
+.deploy_backup_*/
+*.bak
+
+# ---- 调试样本 ----
+body.json
+headers.json
+
+# ---- 本地测试脚本（按需保留在本地，不入库） ----
+test_*.py
