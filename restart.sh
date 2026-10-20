@@ -15,6 +15,19 @@ SERVICE_NAME="${SERVICE_NAME:-claude-code-proxy.service}"
 
 cd "$APP_DIR"
 
+# 加载本地密钥与数据库配置。项目未引入 python-dotenv，只能由这里
+# 或 systemd 的 EnvironmentFile 注入。已存在的环境变量优先，.env 仅补空缺，
+# 不会覆盖 systemd / 调用方传入的值。
+if [[ -f "$APP_DIR/.env" ]]; then
+  while IFS='=' read -r env_key env_val || [[ -n "$env_key" ]]; do
+    env_key="${env_key#"${env_key%%[![:space:]]*}"}"
+    env_key="${env_key#export }"
+    [[ -z "$env_key" || "$env_key" == \#* ]] && continue
+    [[ -n "${!env_key:-}" ]] && continue
+    export "$env_key=$env_val"
+  done < "$APP_DIR/.env"
+fi
+
 # 主进程在 import settings.macro 时读取 TEAMO_API_KEY_FILE；不 source 密钥文件，
 # 避免密钥出现在 shell 环境或命令行参数。旧上游可设 UPSTREAM_PROVIDER=legacy/yunxin。
 export TEAMO_API_KEY_FILE="${TEAMO_API_KEY_FILE:-/etc/claude_code_proxy/teamo_api_key}"
