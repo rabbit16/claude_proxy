@@ -86,6 +86,7 @@ from utils.common_utils import (
     responses_completion_status,
     sanitize_headers,
     sanitize_openai_chat_request,
+    sanitize_stateless_responses_input,
     summarize_request_keys,
     split_sse_events_bytes,
 )
@@ -203,7 +204,7 @@ from utils.request_usage import (
     start_request_usage,
 )
 from utils.unbilled_billing import unbilled_supervisor, usage_has_billable_tokens, usage_is_billed
-from utils.get_log import access_log, process_log, setup_standalone_logging
+from utils.get_log import access_log, deepseek_slow_log, process_log, setup_standalone_logging
 from utils.headroom_compress import get_stats, maybe_compress_request, warmup_headroom
 
 
@@ -222,6 +223,8 @@ UPSTREAM_RETRY_STATUSES = {502}
 UPSTREAM_READ_TIMEOUT = 300.0
 UPSTREAM_POOL_TIMEOUT = 15.0
 UPSTREAM_CLOSE_TIMEOUT = 5.0
+# DeepSeek 首字超过该阈值单独记录到 deepseek_slow.log，便于事后分析慢请求。
+DEEPSEEK_SLOW_TTFB_MS = 10_000
 
 
 def format_upstream_exc(exc: BaseException) -> str:
@@ -572,6 +575,69 @@ def _log_access(
         parts.append(extra)
     access_log.info(" ".join(parts))
     schedule_agent_task(req_id=req_id, finish=finish, result=result, http_status=status)
+
+
+def is_deepseek_model(model: str) -> bool:
+    """模型名是否属于 DeepSeek 家族。
+
+    DeepSeek 专属逻辑必须同时满足「deepseek 模型 + deepseek 供应商」，避免
+    别的模型被路由到 deepseek 供应商时也套用这些规则。
+    """
+    name = strip_openai_model_prefix(model or "").strip().lower()
+    if name.startswith("ft:"):
+        parts = name.split(":")
+        if len(parts) >= 2 and parts[1]:
+            name = parts[1]
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name.startswith("deepseek")
+
+
+def _log_deepseek_slow(
+    *,
+    request: Request,
+    req_id: str,
+    user_id: str,
+    source: str,
+    model: str,
+    upstream_model: str,
+    upstream_base: str,
+    target_url: str,
+    stage: str,
+    started: float,
+    first_event_at: float,
+    headers_at: Optional[float],
+    body_len: int,
+    heartbeats: int,
+    headers: dict,
+    parsed_body: dict,
+):
+    """DeepSeek 上游首字超过阈值时单独留档，便于事后按供应商分析慢请求。"""
+    ttfb_ms = _elapsed_ms(started, first_event_at)
+    if ttfb_ms < DEEPSEEK_SLOW_TTFB_MS:
+        return
+    deepseek_slow_log.info(
+        "slow_ttfb req=%s ip=%s user=%s source=%s model=%s upstream_model=%s path=%s "
+        "base_url=%s target_url=%s stage=%s ttfb_ms=%s headers_ms=%s "
+        "body_bytes=%s heartbeats=%s beta=%s keys=%s session=%s",
+        req_id,
+        _client_ip(request),
+        user_id or "-",
+        source,
+        model or "-",
+        upstream_model or "-",
+        request.url.path,
+        upstream_base,
+        target_url,
+        stage,
+        ttfb_ms,
+        _elapsed_ms(started, headers_at) if headers_at is not None else "-",
+        body_len,
+        heartbeats,
+        (_header_value(headers, "anthropic-beta") or "-")[:160],
+        summarize_request_keys(parsed_body),
+        extract_session_key(parsed_body) or "-",
+    )
 
 
 def _auth_error_response(source: str, reason: str, want_stream: bool):
@@ -1069,6 +1135,22 @@ async def log_and_forward_requests(request: Request, call_next):
             upstream_path = replace_gemini_model_in_path(
                 upstream_path, model if model != "-" else "",
             )
+    # legacy（LiteLLM → 官方 OpenAI）在 store=false 时不持久化 item。客户端从别的
+    # 供应商切过来时，历史里会带官方不存在的 id，回传直接 404。仅对该供应商清理，
+    # 其它供应商保持原样（Teamo 等对未知 id 宽容）。
+    if (
+        runtime_vendor == "legacy"
+        and source == "responses"
+        and not legacy_audio_request
+        and not count_tokens_route
+        and not protocol_adapt
+        and not anthropic_bridge
+        and not responses_bridge
+        and not is_audio_path(request.url.path)
+        and not is_image_path(request.url.path)
+        and not is_gemini_native_path(request.url.path)
+    ):
+        body, parsed_body = sanitize_stateless_responses_input(body, parsed_body)
     count_upstream = get_runtime_upstream(vendor="teamo") if count_tokens_route else None
     count_key = (vendor_api_key("teamo") or CLAUDE_GPT_KEY or "").strip() if count_tokens_route else ""
     if count_tokens_route and (not count_key or not (count_upstream.get("base_url") or "").strip()):
@@ -1099,6 +1181,11 @@ async def log_and_forward_requests(request: Request, call_next):
             api_key=(runtime.get("route_api_key") or "").strip() or vendor_api_key(runtime.get("code") or ""),
             teamo=bool(runtime.get("teamo")),
         )
+    # DeepSeek 会按客户端声明的 Accept-Encoding 返回 br/zstd；服务端 httpx 缺少对应
+    # 解码器时会静默返回压缩字节，SSE 被当成乱码。仅「deepseek 模型 + deepseek
+    # 供应商」去掉该头，交由 httpx 按自身解码能力协商；其他组合保持客户端原始行为。
+    if runtime_vendor == "deepseek" and is_deepseek_model(model) and not count_tokens_route:
+        headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
     compression_extra = ""
     if compression and compression.get("tokens_saved"):
         compression_extra = (
@@ -1138,6 +1225,24 @@ async def log_and_forward_requests(request: Request, call_next):
             LEGACY_UPSTREAM_BASE if legacy_audio_request
             else runtime["base_url"]
         )
+    # DeepSeek 提供 Anthropic 兼容端点，挂在 /anthropic 前缀下。上游最终走
+    # Anthropic 协议时直连该端点，避免打到只认 /v1/messages 之外路径的根地址。
+    # 必须同时是「deepseek 模型 + deepseek 供应商」；其他组合（含把别的模型
+    # 路由到 deepseek 供应商）保持原样，不追加前缀。
+    deepseek_anthropic_route = bool(
+        runtime_vendor == "deepseek"
+        and is_deepseek_model(model)
+        and upstream_path == "/v1/messages"
+        and not count_tokens_route
+        and not legacy_audio_request
+        and not is_image_path(request.url.path)
+        and not is_gemini_native_path(request.url.path)
+    )
+    # 单独留一个请求 base：计费仍使用供应商根地址，只有转发目标加 /anthropic。
+    # 若供应商地址本身就配成 .../anthropic，不重复拼接。
+    request_base = upstream_base
+    if deepseek_anthropic_route and not upstream_base.rstrip("/").endswith("/anthropic"):
+        request_base = f"{upstream_base.rstrip('/')}/anthropic"
     bind_agent_task(
         account=str(user_id or ""),
         model="" if model == "-" else str(model),
@@ -1145,7 +1250,7 @@ async def log_and_forward_requests(request: Request, call_next):
         path=request.url.path,
         session_key=extract_session_key(parsed_body),
     )
-    target_url = f"{upstream_base}{upstream_path}"
+    target_url = f"{request_base}{upstream_path}"
     # Anthropic/Responses 桥接后不要把原 query 原样带给目标端点
     if request.url.query and not anthropic_bridge and not responses_bridge and not protocol_adapt:
         target_url += f"?{request.url.query}"
@@ -1178,6 +1283,10 @@ async def log_and_forward_requests(request: Request, call_next):
         sse_buf = b""
         upstream_status = 0
         first_sse_at: Optional[float] = None
+        upstream_headers_at: Optional[float] = None
+        first_upstream_event_at: Optional[float] = None
+        deepseek_slow_logged = False
+        deepseek_ttfb_evaluated = False
         def make_bridge_stream():
             client_model = model if model != "-" else ""
             if anthropic_bridge:
@@ -1199,6 +1308,46 @@ async def log_and_forward_requests(request: Request, call_next):
             if first_sse_at is None:
                 return None
             return _elapsed_ms(started, first_sse_at)
+
+        def note_deepseek_slow_ttfb(stage: str, observed_at: Optional[float] = None):
+            """DeepSeek 上游首字超过阈值时单独留档，便于事后按供应商分析。
+
+            observed_at 是判定用的时间点：正常是首个上游 SSE 事件；若上游始终
+            没有事件（404 / 空流 / 客户端先断开），用当前时间兜底，同样能留档。
+            每个请求只判定一次：首事件一旦到达就定格，避免把总耗时误当首字耗时。
+            """
+            nonlocal deepseek_slow_logged, deepseek_ttfb_evaluated
+            if (
+                deepseek_ttfb_evaluated
+                or runtime_vendor != "deepseek"
+                or not is_deepseek_model(model)
+            ):
+                return
+            at = observed_at if observed_at is not None else first_upstream_event_at
+            if at is None:
+                return
+            deepseek_ttfb_evaluated = True
+            if _elapsed_ms(started, at) < DEEPSEEK_SLOW_TTFB_MS:
+                return
+            deepseek_slow_logged = True
+            _log_deepseek_slow(
+                request=request,
+                req_id=req_id,
+                user_id=user_id,
+                source=source,
+                model=model,
+                upstream_model=upstream_model,
+                upstream_base=request_base,
+                target_url=target_url,
+                stage=stage,
+                started=started,
+                first_event_at=at,
+                headers_at=upstream_headers_at,
+                body_len=len(body or b""),
+                heartbeats=heartbeats,
+                headers=headers,
+                parsed_body=parsed_body,
+            )
 
         def note_terminator(event_text: str, obj: Optional[dict] = None) -> str:
             nonlocal saw_terminator
@@ -1328,6 +1477,8 @@ async def log_and_forward_requests(request: Request, call_next):
 
         def access_stream(*, status: int, extra: str = ""):
             done_at = time.perf_counter()
+            # 上游始终没吐事件（含 404 / 空流 / 客户端先走）时，用结束时刻兜底判定。
+            note_deepseek_slow_ttfb("stream_end", done_at)
             parts = []
             inferred = last_result
             if not inferred:
@@ -1485,6 +1636,10 @@ async def log_and_forward_requests(request: Request, call_next):
             task.add_done_callback(tasks.discard)
 
         def handle_event(event_text: str):
+            nonlocal first_upstream_event_at
+            if first_upstream_event_at is None:
+                first_upstream_event_at = time.perf_counter()
+                note_deepseek_slow_ttfb("first_upstream_event")
             obj = parse_sse_block(event_text)
             if obj:
                 collector.note_block_index(obj)
@@ -1537,6 +1692,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                 mark_first_sse()
                                 yield b": keep-alive\n\n"
                         assert resp is not None
+                        upstream_headers_at = time.perf_counter()
                         try:
                             collector.note_request_id(headers=dict(resp.headers))
                             upstream_status = resp.status_code
@@ -1855,6 +2011,8 @@ async def log_and_forward_requests(request: Request, call_next):
                     saw_terminator = False
                     terminator_names = []
                     heartbeats = 0
+                    upstream_headers_at = None
+                    first_upstream_event_at = None
                     await asyncio.sleep(UPSTREAM_RETRY_SLEEP)
                     continue
                 break
@@ -1902,6 +2060,26 @@ async def log_and_forward_requests(request: Request, call_next):
         )
         process_log.info("upstream req=%s status=%s", req_id, resp.status_code)
         upstream_at = time.perf_counter()
+        if runtime_vendor == "deepseek" and is_deepseek_model(model):
+            # 非流式同样记录慢首包，判定点是上游返回整个响应体的时刻。
+            _log_deepseek_slow(
+                request=request,
+                req_id=req_id,
+                user_id=user_id,
+                source=source,
+                model=model,
+                upstream_model=upstream_model,
+                upstream_base=request_base,
+                target_url=target_url,
+                stage="non_stream",
+                started=started,
+                first_event_at=upstream_at,
+                headers_at=upstream_at,
+                body_len=len(body or b""),
+                heartbeats=0,
+                headers=headers,
+                parsed_body=parsed_body,
+            )
         parsed_resp = _parse_json_body(resp.content)
         if resp.status_code >= 400:
             process_log.warning(

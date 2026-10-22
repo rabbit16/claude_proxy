@@ -677,6 +677,46 @@ def sanitize_openai_chat_request(body: bytes, parsed_body: dict) -> tuple:
     return _replace_json_request_body(body, updated)
 
 
+def sanitize_stateless_responses_input(body: bytes, parsed_body: dict) -> tuple:
+    """直连官方 OpenAI 且非持久化（store 非 true）时，清理不能复用的历史 item。
+
+    官方 store=false 不保存 item；客户端从别的供应商切过来时，历史里会带着
+    官方侧不存在的 id（如 reasoning 的 rs_…），回传会被 404 拒绝
+    （"Item with id '…' not found. Items are not persisted when store is set to false"）。
+    input item 的 id 是可选的，去掉不影响推理；reasoning item 若没有
+    encrypted_content 则整条丢弃，因为上游无法从纯 id 还原它。
+    """
+    if not isinstance(parsed_body, dict):
+        return body, parsed_body
+    items = parsed_body.get("input")
+    if not isinstance(items, list) or parsed_body.get("store") is True:
+        return body, parsed_body
+
+    kept = []
+    changed = False
+    for item in items:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        itype = (item.get("type") or "").strip().lower()
+        if itype == "item_reference":
+            changed = True
+            continue
+        if itype == "reasoning" and not item.get("encrypted_content"):
+            changed = True
+            continue
+        if item.get("id"):
+            item = {k: v for k, v in item.items() if k != "id"}
+            changed = True
+        kept.append(item)
+    if not changed:
+        return body, parsed_body
+
+    updated = dict(parsed_body)
+    updated["input"] = kept
+    return _replace_json_request_body(body, updated)
+
+
 def dump_openai_request_debug(req_id: str, parsed_body: dict, body: bytes) -> None:
     """把 Cursor 大请求落盘，便于分析号商 400/422。"""
     try:
