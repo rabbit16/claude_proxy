@@ -109,6 +109,7 @@ from settings.models import (
     RequestUsage,
     User,
     UpstreamVendor,
+    UpstreamVendorKey,
     UserApiKey,
     VendorModelPrice,
 )
@@ -118,6 +119,8 @@ from utils.vendor_catalog import (
     active_vendor_code,
     apply_catalog_rate_prices,
     create_or_update_vendor,
+    create_vendor_key,
+    delete_vendor_key,
     delete_vendor_model_price,
     ensure_vendor_catalog,
     ensure_vendor_schema_columns,
@@ -126,15 +129,20 @@ from utils.vendor_catalog import (
     get_vendor_catalog,
     list_admin_vendor_models,
     list_official_catalog,
+    list_vendor_keys,
     list_vendors,
+    migrate_vendor_keys,
     pricing_supervisor,
     refresh_vendor_prices,
+    reload_cache_from_db,
     resolve_vendor,
     scale_catalog_rows,
+    update_vendor_key,
     upsert_single_vendor_model,
     upsert_vendor_prices,
     vendor_api_key,
     vendor_profit_multiplier,
+    vendor_resolved_api_key,
     PRICING_MODE_CATALOG_RATE,
 )
 from utils.api_key_auth import lookup_user_by_credential, phone_blocked_for_model
@@ -375,6 +383,7 @@ async def lifespan(app: FastAPI):
                 await ensure_usage_schema_columns(conn)
                 await conn.run_sync(PricingSettings.__table__.create, checkfirst=True)
                 await conn.run_sync(UpstreamVendor.__table__.create, checkfirst=True)
+                await conn.run_sync(UpstreamVendorKey.__table__.create, checkfirst=True)
                 await conn.run_sync(VendorModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(UserApiKey.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRoute.__table__.create, checkfirst=True)
@@ -392,6 +401,8 @@ async def lifespan(app: FastAPI):
         app.state.balance_backfill_task = asyncio.create_task(backfill_usage_balances())
         await ensure_pricing_settings()
         await ensure_vendor_catalog()
+        await migrate_vendor_keys()
+        await reload_cache_from_db()
         await reload_routes()
         await reload_protocols()
         await reload_aliases()
@@ -972,7 +983,7 @@ async def log_and_forward_requests(request: Request, call_next):
     runtime_vendor = (runtime.get("code") or "").strip().lower()
 
     if runtime_teamo and is_billable_path(request.url.path, model) and not legacy_audio_request:
-        if not (vendor_api_key(runtime_vendor) or CLAUDE_GPT_KEY):
+        if not (vendor_resolved_api_key(runtime_vendor) or CLAUDE_GPT_KEY):
             await finish_request_usage(req_id, 503)
             return JSONResponse(status_code=503, content={"error": {"message": "TEAMO_API_KEY is not configured"}})
         image_route = is_image_path(request.url.path) or is_gemini_native_path(request.url.path)
@@ -1178,7 +1189,7 @@ async def log_and_forward_requests(request: Request, call_next):
     else:
         headers = apply_upstream_auth(
             headers,
-            api_key=(runtime.get("route_api_key") or "").strip() or vendor_api_key(runtime.get("code") or ""),
+            api_key=(runtime.get("route_api_key") or "").strip() or vendor_resolved_api_key(runtime.get("code") or ""),
             teamo=bool(runtime.get("teamo")),
         )
     # DeepSeek 会按客户端声明的 Accept-Encoding 返回 br/zstd；服务端 httpx 缺少对应
@@ -2427,6 +2438,8 @@ class ModelRouteUpsert(BaseModel):
     is_active: bool = True
     note: str = ""
     api_key: Optional[str] = Field(default=None, max_length=512)
+    # 指定该 vendor 下的命名 Key；0 表示清除。与 api_key 互斥，设置了会清掉临时覆盖
+    api_key_id: Optional[int] = None
     # 不传表示保持原名单；空列表表示全部用户
     user_ids: Optional[list[int]] = None
 
@@ -2434,6 +2447,20 @@ class ModelRouteUpsert(BaseModel):
 class ModelRouteKeyReplace(BaseModel):
     model: str = Field(min_length=1, max_length=255)
     api_key: str = Field(min_length=1, max_length=512)
+
+
+class VendorKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    api_key: str = Field(min_length=1, max_length=512)
+    note: str = ""
+
+
+class VendorKeyUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=128)
+    api_key: Optional[str] = Field(default=None, max_length=512)
+    note: Optional[str] = None
+    is_active: Optional[bool] = None
+    is_default: Optional[bool] = None
 
 
 class ModelRewriteUpsert(BaseModel):
@@ -2693,6 +2720,62 @@ async def admin_upsert_vendor(payload: VendorUpsert, request: Request):
     return {"vendor": vendor}
 
 
+@app.get("/v1/admin/vendors/{code}/keys")
+async def admin_list_vendor_keys(code: str, request: Request):
+    """一个供应商下的多把命名 Key，只回掩码。"""
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        keys = await list_vendor_keys(code)
+    except ValueError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    return {"keys": keys}
+
+
+@app.post("/v1/admin/vendors/{code}/keys")
+async def admin_create_vendor_key(code: str, payload: VendorKeyCreate, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        key = await create_vendor_key(
+            code=code, name=payload.name, api_key=payload.api_key, note=payload.note,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"ok": True, "key": key, "keys": await list_vendor_keys(code)}
+
+
+@app.put("/v1/admin/vendors/{code}/keys/{key_id}")
+async def admin_update_vendor_key(code: str, key_id: int, payload: VendorKeyUpdate, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        key = await update_vendor_key(
+            code=code, key_id=key_id, name=payload.name, api_key=payload.api_key,
+            note=payload.note, is_active=payload.is_active, is_default=payload.is_default,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"ok": True, "key": key, "keys": await list_vendor_keys(code)}
+
+
+@app.delete("/v1/admin/vendors/{code}/keys/{key_id}")
+async def admin_delete_vendor_key(code: str, key_id: int, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        ok = await delete_vendor_key(code=code, key_id=key_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "key not found"})
+    return {"ok": True, "keys": await list_vendor_keys(code)}
+
+
 @app.get("/v1/admin/pricing/catalog")
 async def admin_list_official_catalog(
     request: Request,
@@ -2926,6 +3009,7 @@ async def admin_upsert_model_route(payload: ModelRouteUpsert, request: Request):
             note=payload.note,
             route_id=payload.id,
             api_key=payload.api_key,
+            api_key_id=payload.api_key_id,
             user_ids=payload.user_ids,
         )
     except ValueError as exc:

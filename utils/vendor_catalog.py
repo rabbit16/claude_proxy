@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from settings.database import AsyncSessionLocal
 from settings.macro import (
@@ -34,7 +35,7 @@ from settings.macro import (
     YUNXIN_UPSTREAM_BASE,
     LEGACY_UPSTREAM_BASE,
 )
-from settings.models import UpstreamVendor, VendorModelPrice
+from settings.models import ModelRoute, UpstreamVendor, UpstreamVendorKey, VendorModelPrice
 from utils.get_log import process_log
 
 PRICING_MODE_MANUAL = "manual"
@@ -562,7 +563,7 @@ async def ensure_vendor_catalog() -> None:
             "code": "teamo",
             "name": "TeamoRouter",
             "base_url": normalize_base_url(TEAMO_UPSTREAM_BASE),
-            "pricing_url": "https://teamorouter.com/v1/models/pricing",
+            "pricing_url": "https://teamorouter.cn/v1/models/pricing",
             "is_default": UPSTREAM_PROVIDER == "teamo",
             "sort_order": 10,
         },
@@ -657,7 +658,21 @@ async def reload_cache_from_db() -> None:
             prices = (await db.execute(
                 select(VendorModelPrice).where(VendorModelPrice.is_active.is_(True))
             )).scalars().all()
+            keys = (await db.execute(
+                select(UpstreamVendorKey).where(UpstreamVendorKey.is_active.is_(True))
+                .order_by(UpstreamVendorKey.is_default.desc(), UpstreamVendorKey.id)
+            )).scalars().all()
         vendor_by_id = {v.id: v for v in vendors}
+        keys_by_vendor: dict[int, list[dict]] = {}
+        for key in keys:
+            keys_by_vendor.setdefault(key.vendor_id, []).append({
+                "id": key.id,
+                "name": key.name or "",
+                "api_key": (key.api_key or "").strip(),
+                "is_default": bool(key.is_default),
+                "is_active": bool(key.is_active),
+                "note": key.note or "",
+            })
         for vendor in vendors:
             next_meta[vendor.code] = {
                 "id": vendor.id,
@@ -665,6 +680,7 @@ async def reload_cache_from_db() -> None:
                 "name": vendor.name,
                 "base_url": vendor.base_url,
                 "api_key": (getattr(vendor, "api_key", None) or "").strip(),
+                "keys": keys_by_vendor.get(vendor.id, []),
                 "pricing_url": vendor.pricing_url,
                 "pricing_mode": getattr(vendor, "pricing_mode", None) or PRICING_MODE_MANUAL,
                 "cost_rate": getattr(vendor, "cost_rate", None),
@@ -794,9 +810,274 @@ def vendor_api_key(code: str = "") -> str:
     return ((meta or {}).get("api_key") or "").strip()
 
 
+def vendor_default_key_secret(code: str) -> str:
+    """供应商标记为默认的命名 Key；没有则返回空串。"""
+    code = (code or "").strip().lower()
+    meta = _vendor_meta.get(code) or {}
+    for key in meta.get("keys") or []:
+        if key.get("is_default"):
+            return (key.get("api_key") or "").strip()
+    return ""
+
+
+def vendor_resolved_api_key(code: str) -> str:
+    """转发实际使用的供应商密钥：默认命名 Key 优先，其次 vendor 兜底 Key。
+
+    名称带 resolved 以便和只读 vendor.api_key 的 vendor_api_key 区分开。
+    """
+    return vendor_default_key_secret(code) or vendor_api_key(code)
+
+
+def vendor_key_secret(code: str, key_id: Optional[int]) -> str:
+    """按 id 取某供应商下的一把命名 Key；找不到返回空串。"""
+    if not key_id:
+        return ""
+    code = (code or "").strip().lower()
+    meta = _vendor_meta.get(code) or {}
+    for key in meta.get("keys") or []:
+        if int(key.get("id") or 0) == int(key_id):
+            return (key.get("api_key") or "").strip()
+    return ""
+
+
+def vendor_key_label(code: str, key_id: Optional[int]) -> str:
+    """路由列表展示用的 Key 名称。"""
+    if not key_id:
+        return ""
+    code = (code or "").strip().lower()
+    meta = _vendor_meta.get(code) or {}
+    for key in meta.get("keys") or []:
+        if int(key.get("id") or 0) == int(key_id):
+            return key.get("name") or ""
+    return ""
+
+
+async def list_vendor_keys(code: str) -> list[dict]:
+    """后台读取某供应商全部命名 Key（含停用），密钥已掩码。"""
+    code = (code or "").strip().lower()
+    async with AsyncSessionLocal() as db:
+        vendor = (await db.execute(
+            select(UpstreamVendor).where(UpstreamVendor.code == code)
+        )).scalars().first()
+        if vendor is None:
+            raise ValueError(f"unknown vendor: {code}")
+        rows = (await db.execute(
+            select(UpstreamVendorKey)
+            .where(UpstreamVendorKey.vendor_id == vendor.id)
+            .order_by(UpstreamVendorKey.is_default.desc(), UpstreamVendorKey.id)
+        )).scalars().all()
+    return [
+        {
+            "id": row.id,
+            "name": row.name or "",
+            "api_key_hint": _mask_api_key((row.api_key or "").strip()),
+            "is_default": bool(row.is_default),
+            "is_active": bool(row.is_active),
+            "note": row.note or "",
+        }
+        for row in rows
+    ]
+
+
+async def _clear_other_defaults(db, vendor_id: int, keep_id: int) -> None:
+    others = (await db.execute(
+        select(UpstreamVendorKey).where(UpstreamVendorKey.vendor_id == vendor_id)
+    )).scalars().all()
+    for other in others:
+        other.is_default = other.id == keep_id
+
+
+async def create_vendor_key(*, code: str, name: str, api_key: str, note: str = "") -> dict:
+    code = (code or "").strip().lower()
+    name = (name or "").strip()
+    api_key = (api_key or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    if not api_key:
+        raise ValueError("api_key is required")
+    if len(api_key) > 512:
+        raise ValueError("api_key is too long")
+    async with AsyncSessionLocal() as db:
+        vendor = (await db.execute(
+            select(UpstreamVendor).where(UpstreamVendor.code == code)
+        )).scalars().first()
+        if vendor is None:
+            raise ValueError(f"unknown vendor: {code}")
+        clash = (await db.execute(
+            select(UpstreamVendorKey).where(
+                UpstreamVendorKey.vendor_id == vendor.id, UpstreamVendorKey.name == name
+            )
+        )).scalars().first()
+        if clash:
+            raise ValueError(f"key name already exists: {name}")
+        is_first = (await db.scalar(
+            select(UpstreamVendorKey.id).where(UpstreamVendorKey.vendor_id == vendor.id).limit(1)
+        )) is None
+        row = UpstreamVendorKey(
+            vendor_id=vendor.id,
+            name=name,
+            api_key=api_key,
+            is_default=is_first,
+            is_active=True,
+            note=(note or "")[:200],
+        )
+        db.add(row)
+        try:
+            await db.commit()
+        except IntegrityError:
+            # 并发重名时唯一约束兜底，转成可读的 400 而不是 500
+            await db.rollback()
+            raise ValueError(f"key name already exists: {name}")
+        await db.refresh(row)
+    await reload_cache_from_db()
+    return await _one_key(code, row.id)
+
+
+async def update_vendor_key(
+    *,
+    code: str,
+    key_id: int,
+    name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    note: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    is_default: Optional[bool] = None,
+) -> dict:
+    code = (code or "").strip().lower()
+    async with AsyncSessionLocal() as db:
+        vendor = (await db.execute(
+            select(UpstreamVendor).where(UpstreamVendor.code == code)
+        )).scalars().first()
+        if vendor is None:
+            raise ValueError(f"unknown vendor: {code}")
+        row = await db.get(UpstreamVendorKey, key_id)
+        if row is None or row.vendor_id != vendor.id:
+            raise ValueError("key not found")
+        if name is not None:
+            new_name = name.strip()
+            if not new_name:
+                raise ValueError("name is required")
+            clash = (await db.execute(
+                select(UpstreamVendorKey).where(
+                    UpstreamVendorKey.vendor_id == vendor.id,
+                    UpstreamVendorKey.name == new_name,
+                    UpstreamVendorKey.id != row.id,
+                )
+            )).scalars().first()
+            if clash:
+                raise ValueError(f"key name already exists: {new_name}")
+            row.name = new_name
+        if api_key is not None:
+            new_key = api_key.strip()
+            if not new_key:
+                raise ValueError("api_key is required")
+            if len(new_key) > 512:
+                raise ValueError("api_key is too long")
+            row.api_key = new_key
+        if note is not None:
+            row.note = (note or "")[:200]
+        if is_active is not None:
+            if not is_active:
+                # 停用前挡住：被路由引用的 Key 停用后会静默掉到兜底 Key，容易误判
+                used = await db.scalar(
+                    select(ModelRoute.id).where(ModelRoute.api_key_id == row.id).limit(1)
+                )
+                if used is not None:
+                    raise ValueError("该 Key 仍被模型路由引用，请先改掉那些路由再停用")
+            row.is_active = bool(is_active)
+        if is_default:
+            await _clear_other_defaults(db, vendor.id, row.id)
+            row.is_default = True
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise ValueError(f"key name already exists: {(name or '').strip()}")
+    await reload_cache_from_db()
+    return await _one_key(code, key_id)
+
+
+async def _one_key(code: str, key_id: int) -> dict:
+    keys = await list_vendor_keys(code)
+    found = next((item for item in keys if item["id"] == key_id), None)
+    if found is None:
+        raise ValueError("key not found")
+    return found
+
+
+async def delete_vendor_key(*, code: str, key_id: int) -> bool:
+    code = (code or "").strip().lower()
+    async with AsyncSessionLocal() as db:
+        vendor = (await db.execute(
+            select(UpstreamVendor).where(UpstreamVendor.code == code)
+        )).scalars().first()
+        if vendor is None:
+            raise ValueError(f"unknown vendor: {code}")
+        row = await db.get(UpstreamVendorKey, key_id)
+        if row is None or row.vendor_id != vendor.id:
+            return False
+        used = await db.scalar(
+            select(ModelRoute.id).where(ModelRoute.api_key_id == key_id).limit(1)
+        )
+        if used is not None:
+            raise ValueError("该 Key 仍被模型路由引用，请先改掉那些路由再删除")
+        await db.delete(row)
+        await db.commit()
+    await reload_cache_from_db()
+    return True
+
+
+MIGRATED_KEY_NOTE = "由原有供应商 Key 自动迁移"
+
+
+async def migrate_vendor_keys() -> None:
+    """把存量 vendor.api_key 幂等地迁成名为「默认」的命名 Key，旧路由行为不变。
+
+    迁移过一次的供应商会留下标记，管理员删掉这把 Key 后不会被下次启动重建。
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            vendors = (await db.execute(select(UpstreamVendor))).scalars().all()
+            existing = (await db.execute(select(UpstreamVendorKey))).scalars().all()
+            by_vendor: dict[int, list[UpstreamVendorKey]] = {}
+            for key in existing:
+                by_vendor.setdefault(key.vendor_id, []).append(key)
+            added = False
+            for vendor in vendors:
+                keys = by_vendor.get(vendor.id) or []
+                if keys:
+                    continue
+                if bool(getattr(vendor, "key_migration_done", False)):
+                    continue
+                raw = (getattr(vendor, "api_key", None) or "").strip()
+                if not raw:
+                    continue
+                db.add(UpstreamVendorKey(
+                    vendor_id=vendor.id, name="默认", api_key=raw, is_default=True,
+                    is_active=True, note=MIGRATED_KEY_NOTE,
+                ))
+                vendor.key_migration_done = True
+                added = True
+            if added:
+                await db.commit()
+    except Exception:
+        process_log.exception("migrate vendor keys failed")
+
+
+def _redact_vendor_keys(keys: list[dict]) -> list[dict]:
+    """后台只回传命中掩码，出站永远不带明文密钥。"""
+    out = []
+    for key in keys or []:
+        item = dict(key)
+        item["api_key_hint"] = _mask_api_key((item.pop("api_key", None) or "").strip())
+        out.append(item)
+    return out
+
+
 def redact_vendor_meta(meta: Optional[dict], *, admin: bool = False) -> dict:
     item = dict(meta or {})
     raw = (item.pop("api_key", None) or "").strip()
+    item["keys"] = _redact_vendor_keys(item.get("keys") or [])
     if admin:
         item["has_api_key"] = bool(raw)
         item["api_key_hint"] = _mask_api_key(raw)
@@ -816,12 +1097,14 @@ def list_vendors(*, include_pricing_meta: bool = False) -> list[dict]:
         if include_pricing_meta:
             item["has_api_key"] = bool(raw_key)
             item["api_key_hint"] = _mask_api_key(raw_key)
+            item["keys"] = _redact_vendor_keys(item.get("keys") or [])
         else:
             # 前台/普通鉴权不暴露接入倍率、计价模式、分类型策略和上游密钥
             item.pop("pricing_mode", None)
             item.pop("cost_rate", None)
             item.pop("catalog_policy", None)
             item.pop("profit_multiplier", None)
+            item.pop("keys", None)
         items.append(item)
     return items
 
@@ -1305,8 +1588,10 @@ async def ensure_vendor_schema_columns(conn) -> None:
         "ALTER TABLE tb_upstream_vendor ADD COLUMN cost_rate DOUBLE NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN profit_multiplier DOUBLE NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN api_key VARCHAR(512) NULL",
+        "ALTER TABLE tb_upstream_vendor ADD COLUMN key_migration_done TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN catalog_policy JSON NULL",
         "ALTER TABLE tb_model_route ADD COLUMN api_key VARCHAR(512) NULL",
+        "ALTER TABLE tb_model_route ADD COLUMN api_key_id INT NULL",
         "ALTER TABLE tb_model_route ADD COLUMN user_ids JSON NULL",
         "ALTER TABLE tb_user ADD COLUMN phone_key_revoked TINYINT(1) NOT NULL DEFAULT 0",
         "UPDATE tb_user u SET phone_key_revoked = 1 WHERE phone_key_revoked = 0 AND EXISTS (SELECT 1 FROM tb_user_api_key k WHERE k.user_id = u.user_id)",

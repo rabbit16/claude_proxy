@@ -8,7 +8,15 @@ from sqlalchemy import select
 from settings.database import AsyncSessionLocal
 from settings.models import ModelRoute, User
 from utils.get_log import process_log
-from utils.vendor_catalog import _mask_api_key, get_runtime_upstream, get_vendor_catalog, resolve_vendor
+from utils.vendor_catalog import (
+    _mask_api_key,
+    get_runtime_upstream,
+    get_vendor_catalog,
+    resolve_vendor,
+    vendor_default_key_secret,
+    vendor_key_label,
+    vendor_key_secret,
+)
 
 # 按 model 长度降序，便于最长前缀命中
 _cache: list[dict] = []
@@ -60,6 +68,7 @@ def _row_dict(row: ModelRoute) -> dict:
         "model": (row.model or "").strip().lower(),
         "vendor_code": (row.vendor_code or "").strip().lower(),
         "api_key": (getattr(row, "api_key", None) or "").strip(),
+        "api_key_id": getattr(row, "api_key_id", None),
         "user_ids": user_ids,
         "user_id_set": set(user_ids),
         "is_active": bool(row.is_active),
@@ -98,6 +107,8 @@ def _public_route(item: dict) -> dict:
     out["users"] = users
     out["has_api_key"] = bool(raw)
     out["api_key_hint"] = _mask_api_key(raw)
+    key_id = out.get("api_key_id")
+    out["key_name"] = vendor_key_label(out.get("vendor_code") or "", key_id) if key_id else ""
     return out
 
 
@@ -266,7 +277,15 @@ def resolve_runtime_for_model(model: str, user_key: str = "") -> dict:
     override = get_runtime_upstream(vendor=rule["vendor_code"])
     if not override or not override.get("code"):
         return default
+    # 优先级：规则临时覆盖 Key > 规则指定的命名 Key > 该供应商默认命名 Key
+    # 后续调用方再用 vendor 兜底 Key / 全局 Key
     route_key = (rule.get("api_key") or "").strip()
+    key_id = rule.get("api_key_id")
+    if not route_key:
+        if key_id:
+            route_key = vendor_key_secret(rule["vendor_code"], key_id)
+        else:
+            route_key = vendor_default_key_secret(rule["vendor_code"])
     same_vendor = override.get("code") == default.get("code")
     if same_vendor and not route_key:
         return default
@@ -355,12 +374,15 @@ async def upsert_route(
     note: str = "",
     route_id: Optional[int] = None,
     api_key: Optional[str] = None,
+    api_key_id: Optional[int] = None,
     user_ids: Optional[list] = None,
 ) -> dict:
     model = normalize_route_pattern(model)
     vendor_code = (vendor_code or "").strip().lower()
     if not resolve_vendor(vendor=vendor_code):
         raise ValueError(f"unknown vendor: {vendor_code}")
+    if api_key_id and not vendor_key_secret(vendor_code, api_key_id):
+        raise ValueError(f"unknown vendor key: {api_key_id}")
     async with AsyncSessionLocal() as db:
         row = None
         if route_id:
@@ -382,6 +404,11 @@ async def upsert_route(
         row.note = (note or "")[:200]
         if api_key is not None:
             row.api_key = (api_key or "").strip() or None
+        if api_key_id is not None:
+            # 指定命名 Key 时清掉临时覆盖，避免两套密钥同时存在产生歧义
+            row.api_key_id = int(api_key_id) or None
+            if row.api_key_id:
+                row.api_key = None
         if user_ids is not None:
             ids = normalize_user_ids(user_ids)
             if len(ids) > 500:

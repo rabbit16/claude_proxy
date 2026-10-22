@@ -194,6 +194,8 @@ class UpstreamVendor(Base):
     name = Column(String(128), nullable=False, default="")
     base_url = Column(String(512), nullable=False, index=True)
     api_key = Column(String(512), nullable=True)  # 转发到该号商时使用的上游密钥
+    # 存量 api_key 是否已迁到 tb_upstream_vendor_key；迁过就不再自动重建，避免删掉后被重新插入
+    key_migration_done = Column(Boolean, nullable=False, default=False, server_default="0")
     pricing_url = Column(String(512), nullable=True)
     pricing_mode = Column(String(32), nullable=False, default="manual")  # manual | catalog_rate
     cost_rate = Column(Float, nullable=True)  # e.g. 0.2；仅 catalog_rate 使用
@@ -208,16 +210,39 @@ class UpstreamVendor(Base):
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
 
+class UpstreamVendorKey(Base):
+    """供应商下的多把命名密钥。
+
+    一个 vendor 可以挂多把 Key（如 tongtong 的 4 把），模型路由直接选其中一把；
+    换 Key 只改这里，不用重建路由。vendor.api_key 保留为最终兜底。
+    """
+    __tablename__ = "tb_upstream_vendor_key"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vendor_id = Column(Integer, ForeignKey("tb_upstream_vendor.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(128), nullable=False, default="")
+    api_key = Column(String(512), nullable=False)
+    is_default = Column(Boolean, nullable=False, default=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    note = Column(String(200), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        UniqueConstraint("vendor_id", "name", name="uq_vendor_key_name"),
+    )
+
+
 class ModelRoute(Base):
     """按模型覆盖上游。默认走当前 is_default 供应商，命中规则则改走指定 vendor。
 
     user_ids 为空表示全部用户；非空时只有这些用户改走该厂商，计价也用该厂商价目。
+    api_key_id 指向 tb_upstream_vendor_key，选择该 vendor 下的某把命名 Key。
     """
     __tablename__ = "tb_model_route"
     id = Column(Integer, primary_key=True, autoincrement=True)
     model = Column(String(255), nullable=False, unique=True, index=True)
     vendor_code = Column(String(64), nullable=False, index=True)
     api_key = Column(String(512), nullable=True)  # 命中该模型时覆盖供应商密钥；空则沿用供应商
+    api_key_id = Column(Integer, nullable=True)  # 选指定 vendor Key；与 api_key 互斥
     user_ids = Column(JSON, nullable=True)  # 空/NULL=全部用户；否则仅这些 tb_user.user_id
     is_active = Column(Boolean, nullable=False, default=True)
     note = Column(String(200), nullable=False, default="")
