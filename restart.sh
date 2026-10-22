@@ -31,8 +31,8 @@ fi
 # 主进程在 import settings.macro 时读取 TEAMO_API_KEY_FILE；不 source 密钥文件，
 # 避免密钥出现在 shell 环境或命令行参数。旧上游可设 UPSTREAM_PROVIDER=legacy/yunxin。
 export TEAMO_API_KEY_FILE="${TEAMO_API_KEY_FILE:-/etc/claude_code_proxy/teamo_api_key}"
-# 远端无法直连 TeamoRouter：固定走本机 FlClash。
-export TEAMO_HTTP_PROXY="${TEAMO_HTTP_PROXY:-http://127.0.0.1:7890}"
+# 上游 api.teamorouter.cn 国内可直连，默认不再走本机 FlClash。
+export TEAMO_HTTP_PROXY="${TEAMO_HTTP_PROXY:-}"
 # 压缩会改写已缓存的历史。启动时固定关闭，避免继承到的环境变量把它打开。
 export HEADROOM_ENABLED=0
 export HEADROOM_KOMPRESS=0

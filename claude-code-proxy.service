@@ -1,23 +1,21 @@
 [Unit]
-Description=Claude Code Proxy (TeamoRouter via FlClash)
+Description=Claude Code Proxy (TeamoRouter)
 Documentation=file:///mnt/data/claude_code_proxy/restart.sh
-Wants=network-online.target flclash-headless.service
-After=network-online.target flclash-headless.service
-# FlClash 挂了也尽量重启本服务；真正出站仍依赖 7890。
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/mnt/data/claude_code_proxy
-# 永久挂本机 HTTP 代理；勿再手启 python main.py。
-Environment=TEAMO_HTTP_PROXY=http://127.0.0.1:7890
+# 上游 api.teamorouter.cn 国内可直连，不再经本机代理。
+# 数据库连接串等敏感配置放在 .env（600）；文件不存在时不影响启动。
+EnvironmentFile=-/mnt/data/claude_code_proxy/.env
 Environment=TEAMO_API_KEY_FILE=/etc/claude_code_proxy/teamo_api_key
 Environment=HEADROOM_ENABLED=0
 Environment=HEADROOM_KOMPRESS=0
 Environment=PYTHONUNBUFFERED=1
-# 等 FlClash 监听 7890，避免开机竞态直连失败。
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ss -lptn 2>/dev/null | grep -q ":7890" && exit 0; sleep 1; done; echo "warn: :7890 not ready, starting anyway" >&2; exit 0'
 ExecStart=/root/anaconda3/envs/claude_code/bin/python3.12 main.py
 Restart=always
 RestartSec=5s
