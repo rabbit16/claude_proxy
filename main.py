@@ -251,6 +251,10 @@ def should_retry_stream_transport(exc: BaseException, attempt: int, client_event
     return attempt < UPSTREAM_RETRY_ATTEMPTS
 
 
+# 关闭上游流时脱离调用方取消域，确保被打断的 close 也能跑完。
+_UPSTREAM_CLOSERS: set[asyncio.Task] = set()
+
+
 async def release_upstream_stream(stream_cm, resp, *, timeout: float = UPSTREAM_CLOSE_TIMEOUT) -> None:
     """归还一次上游流。关闭卡住时直接拆 TCP，避免对端已断开的套接字停在 CLOSE-WAIT 里占满连接池。"""
 
@@ -258,16 +262,25 @@ async def release_upstream_stream(stream_cm, resp, *, timeout: float = UPSTREAM_
         try:
             await stream_cm.__aexit__(None, None, None)
             return
-        except Exception:
+        except BaseException:
             pass
         if resp is not None:
             try:
                 await resp.aclose()
-            except Exception:
+            except BaseException:
                 pass
 
+    # 流式生成器在客户端断连时本身处于取消状态，直接 await 会让 close 再次被取消，
+    # socket 停在 CLOSE-WAIT；httpcore 之后只会把它从池中移除，不会关闭底层传输。
+    close_task = asyncio.create_task(_close())
+    _UPSTREAM_CLOSERS.add(close_task)
+    close_task.add_done_callback(_UPSTREAM_CLOSERS.discard)
     try:
-        await asyncio.wait_for(_close(), timeout)
+        await asyncio.wait_for(asyncio.shield(close_task), timeout)
+        return
+    except asyncio.CancelledError:
+        # 关闭任务已脱离当前取消域继续执行；取消继续向上传播。
+        raise
     except Exception:
         network = None
         if resp is not None:
