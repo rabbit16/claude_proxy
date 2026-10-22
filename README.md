@@ -47,8 +47,9 @@ utils/
 docs/                   接口与设计文档
 deploy.sh               同步到远端并重启
 restart.sh              本地/远端重启（优先 systemd）
+install-service.sh      按当前机器路径安装 systemd unit
 gunicorn.conf.py        gunicorn 配置（可选部署方式）
-claude-code-proxy.service  systemd unit 示例
+claude-code-proxy.service  systemd unit 模板（@APP_DIR@ 等由安装脚本填充）
 ```
 
 ## 快速开始
@@ -100,10 +101,11 @@ chmod 600 .env
 # 开发
 python main.py                     # 监听 0.0.0.0:4000
 
-# 生产（systemd）
-sudo cp claude-code-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
+# 生产（systemd）：按当前目录和 python 自动填充路径
+./install-service.sh
 sudo systemctl enable --now claude-code-proxy
+# 路径/端口不同时显式指定
+# APP_DIR=/opt/proxy PYTHON=/usr/bin/python3.12 APP_PORT=4100 ./install-service.sh
 
 # 或 gunicorn
 gunicorn -c gunicorn.conf.py main:app
@@ -258,6 +260,28 @@ GET  /v1/admin/runtime                # 当前运行时上游
 - 未结算请求由 `unbilled_billing` 后台任务补偿。
 
 ## 部署
+
+### 换机器后从零拉起
+
+```bash
+git clone <repo> claude_proxy && cd claude_proxy
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env && chmod 600 .env      # 填 TEAMO_API_KEY / DATABASE_URL
+# 密钥文件（选填，TEAMO_API_KEY 为空时兜底）
+sudo mkdir -p /etc/claude_code_proxy
+sudo install -m 600 /dev/stdin /etc/claude_code_proxy/teamo_api_key <<< '<key>'
+
+./install-service.sh                        # 生成并安装 systemd unit
+sudo systemctl enable --now claude-code-proxy
+```
+
+`install-service.sh` 默认取**当前仓库目录**、`python3`、端口 `4000`；换机器路径不同时用
+`APP_DIR=/opt/proxy PYTHON=/usr/bin/python3.12 APP_PORT=4100 ./install-service.sh` 覆盖。
+`main.py` 也支持 `APP_HOST` / `APP_PORT` 环境变量。不可用 systemd 时直接 `./restart.sh` 走 nohup。
+
+`.env` 与密钥文件**不入库**，需自行从旧机器搬或重新申请。
 
 ### 同步到远端
 

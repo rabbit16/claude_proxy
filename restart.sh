@@ -5,9 +5,11 @@
 # 未安装 unit 时回退到手工 nohup 启动，并同样注入代理环境变量。
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/mnt/data/claude_code_proxy}"
-PYTHON="${PYTHON:-/root/anaconda3/envs/claude_code/bin/python3.12}"
-PORT="${PORT:-4000}"
+# 默认按脚本所在目录部署，换机器后 clone 到任意路径都能直接跑。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
+PYTHON="${PYTHON:-$(command -v python3 || echo /root/anaconda3/envs/claude_code/bin/python3.12)}"
+PORT="${PORT:-${APP_PORT:-4000}}"
 PID_FILE="${PID_FILE:-$APP_DIR/proxy.pid}"
 LOG_FILE="${LOG_FILE:-$APP_DIR/nohup.out}"
 WAIT_SECS="${WAIT_SECS:-15}"

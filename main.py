@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -3819,8 +3820,8 @@ async def headroom_stats():
 
 if __name__ == "__main__":
     run_kwargs = {
-        "host": "0.0.0.0",
-        "port": 4000,
+        "host": os.environ.get("APP_HOST", "0.0.0.0").strip() or "0.0.0.0",
+        "port": int(os.environ.get("APP_PORT", "4000") or 4000),
         "timeout_keep_alive": 75,
         "limit_concurrency": LIMIT_CONCURRENCY,
     }
