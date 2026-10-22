@@ -35,7 +35,7 @@ if UPSTREAM_PROVIDER not in {"teamo", "legacy", "yunxin"}:
     raise ValueError("UPSTREAM_PROVIDER must be teamo, legacy or yunxin")
 TEAMO_UPSTREAM = UPSTREAM_PROVIDER == "teamo"
 VENDOR_UPSTREAM = UPSTREAM_PROVIDER == "yunxin"
-TEAMO_UPSTREAM_BASE = os.environ.get("TEAMO_UPSTREAM_BASE", "https://api.teamorouter.com").strip().rstrip("/")
+TEAMO_UPSTREAM_BASE = os.environ.get("TEAMO_UPSTREAM_BASE", "https://api.teamorouter.cn").strip().rstrip("/")
 # 仅远端直连受阻时设置，如 http://127.0.0.1:7890；留空则直连。
 TEAMO_HTTP_PROXY = os.environ.get("TEAMO_HTTP_PROXY", "").strip() or None
 UPSTREAM_BASE = (
@@ -408,7 +408,7 @@ def _img_per_call(tiers: dict, *, text_in=0.0, image_in=0.0, image_out=0.0, text
     return row
 
 
-# https://teamorouter.com/v1/models/pricing 绘图模型快照（2026-10-01）。
+# https://teamorouter.cn/v1/models/pricing 绘图模型快照（2026-10-01）。
 # GPT Image：官网按输出最长边分 1K/2K/4K 按张计费（per_call_tiers.cost）。
 # Gemini Image：按 token 计费（input/output，$ / 1M tokens）。
 TEAMO_IMAGE_MODEL_MONEY_DICT = {
@@ -456,7 +456,7 @@ def _load_teamo_api_key() -> str:
 
 CLAUDE_GPT_KEY = _load_teamo_api_key() if TEAMO_UPSTREAM else os.environ.get("CLAUDE_GPT_KEY", "").strip()
 
-# https://teamorouter.com/zh#pricing 展开全表的折后价格快照（2026-09-26，USD / 1M tokens）。
+# https://teamorouter.cn/zh#pricing 展开全表的折后价格快照（2026-09-26，USD / 1M tokens）。
 # 价格随上游波动；本地快照不是实时结算价，必须定期重新核价。
 # DeepSeek 官网分峰/谷，但未公布准确时段；此处按峰值计费以避免漏扣。
 # 绘图模型见 TEAMO_IMAGE_MODEL_MONEY_DICT（GPT Image 按张，Gemini Image 按 token）。

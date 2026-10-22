@@ -292,7 +292,7 @@ Content-Type: application/json
 - `GET /v1/vendors`：供应商列表（含 `base_url`、`model_count`）
 - `GET /v1/pricing/models?vendor=teamo`：该供应商下，按利润倍率及用户 `money_rate`/`discount` 计算后的 **USD** 价
 
-也可 `?base_url=https://api.teamorouter.com` 按上游地址选价目表。
+也可 `?base_url=https://api.teamorouter.cn` 按上游地址选价目表。
 
 响应示例（数值仅示例）：
 
@@ -303,7 +303,7 @@ Content-Type: application/json
   "vendor": {
     "code": "teamo",
     "name": "TeamoRouter",
-    "base_url": "https://api.teamorouter.com",
+    "base_url": "https://api.teamorouter.cn",
     "is_current": true
   },
   "usd_cny_rate": 6.9,

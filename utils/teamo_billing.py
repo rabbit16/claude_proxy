@@ -3,7 +3,7 @@
 模型调用返回 request_id 后，查 GET /v1/billing/requests/{request_id}，
 用对方的 amount（USD）再乘 profit_multiplier × money_rate × discount。
 只用于 teamo，其它供应商仍按 token 价目。
-文档：https://teamorouter.com/zh/docs/open-api
+文档：https://teamorouter.cn/zh/docs/open-api
 """
 from __future__ import annotations
 
@@ -132,8 +132,8 @@ def teamo_billing_bases(vendor_base_url: str = "") -> list[str]:
     for raw in (
         vendor_base_url,
         TEAMO_UPSTREAM_BASE,
-        "https://api.teamorouter.com",
-        "https://teamorouter.com",
+        "https://api.teamorouter.cn",
+        "https://teamorouter.cn",
     ):
         base = (raw or "").strip().rstrip("/")
         if base.endswith("/v1"):

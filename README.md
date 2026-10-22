@@ -82,7 +82,7 @@ chmod 600 .env
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `UPSTREAM_PROVIDER` | `teamo` | `teamo` / `legacy` / `yunxin` |
-| `TEAMO_UPSTREAM_BASE` | `https://api.teamorouter.com` | TeamoRouter 根地址，**不要带 `/v1`** |
+| `TEAMO_UPSTREAM_BASE` | `https://api.teamorouter.cn` | TeamoRouter 根地址，**不要带 `/v1`** |
 | `TEAMO_HTTP_PROXY` | 空 | 直连受阻时填本机代理，如 `http://127.0.0.1:7890` |
 | `TEAMO_API_KEY_FILE` | `/etc/claude_code_proxy/teamo_api_key` | 密钥文件（需 `chmod 600`），`TEAMO_API_KEY` 为空时兜底 |
 | `HEADROOM_ENABLED` | `0` | 是否启用请求压缩 |
