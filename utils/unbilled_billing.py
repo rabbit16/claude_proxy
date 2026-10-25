@@ -153,7 +153,7 @@ async def usage_is_billed(req_id: str) -> bool:
 
 
 async def charge_usage_row(row, *, phone: str, vendor: str):
-    """按当前供应商价目扣这一笔。电话号码是 compute_user_token 的用户键。"""
+    """按当前供应商价目扣这一笔。phone 是鉴权用的用户键（手机号或匿名用户主键）。"""
     return await compute_user_token(
         token_dict=token_usage_dict(row),
         body={"model": row.model or ""},
@@ -225,6 +225,7 @@ async def _select_candidates() -> list:
 
 
 async def _phones_for(user_ids: list) -> dict:
+    """主键 -> 计费键。匿名用户没有手机号，回落到主键字符串。"""
     ids = []
     for item in user_ids:
         try:
@@ -239,7 +240,11 @@ async def _phones_for(user_ids: list) -> dict:
         rows = (await db.execute(
             select(User.user_id, User.telephone).where(User.user_id.in_(ids))
         )).all()
-    return {int(user_id): (telephone or "").strip() for user_id, telephone in rows if telephone}
+    keys = {}
+    for user_id, telephone in rows:
+        phone = (telephone or "").strip()
+        keys[int(user_id)] = phone or str(int(user_id))
+    return keys
 
 
 async def reconcile_unbilled_once() -> dict:

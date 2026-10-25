@@ -17,6 +17,7 @@ from settings.database import AsyncSessionLocal
 from settings.models import AgentTask, User
 from utils.common_utils import AUTH_FAIL_REASONS, normalize_upstream_path
 from utils.get_log import process_log
+from utils.task_guard import finish_writes
 
 TRACKED_PATHS = {"/v1/messages", "/v1/responses", "/v1/chat/completions"}
 TOOL_FINISH = {"tool_use", "tool_calls", "function_call"}
@@ -130,7 +131,8 @@ async def record_agent_task(*, ctx: dict, req_id: str, finish: str, result: str,
     judged = judge_task(finish, result, http_status)
     decision = explain_task(judged, finish, result)[:300]
     lock_key = f"{account}|{ctx.get('session_key') or ''}|{ctx.get('model') or ''}|{ctx.get('source') or ''}"
-    try:
+
+    async def write():
         async with _lock_for(lock_key):
             async with AsyncSessionLocal() as db:
                 now = datetime.now()
@@ -179,6 +181,9 @@ async def record_agent_task(*, ctx: dict, req_id: str, finish: str, result: str,
                         row.status = judged
                         row.status_source = "log"
                 await db.commit()
+
+    try:
+        await finish_writes(write)
     except Exception:
         process_log.exception("agent task record failed req=%s", req_id)
 
@@ -206,8 +211,18 @@ async def _find_open(db, ctx: dict, now: datetime):
 
 
 async def _user_id_for_account(db, account: str) -> Optional[int]:
+    """账号通常是手机号；匿名用户的计费键是主键字符串，只在电话为空时按主键匹配。"""
     user_id = await db.scalar(select(User.user_id).where(
         User.telephone == account,
+        or_(User.is_delete.is_(False), User.is_delete.is_(None)),
+    ))
+    if user_id:
+        return int(user_id)
+    if not (account or "").isdigit():
+        return None
+    user_id = await db.scalar(select(User.user_id).where(
+        User.user_id == int(account),
+        or_(User.telephone.is_(None), User.telephone == ""),
         or_(User.is_delete.is_(False), User.is_delete.is_(None)),
     ))
     return int(user_id) if user_id else None

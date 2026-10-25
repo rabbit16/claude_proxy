@@ -92,12 +92,50 @@ def headroom_enabled() -> bool:
     return bool(HEADROOM_ENABLED)
 
 
+_IMAGE_CONTENT_TYPES = {"image", "image_url", "input_image"}
+
+
+def _has_image_part(parsed_body: dict) -> bool:
+    """请求是否携带图片块。
+
+    带图请求的 body 通常有几 MB 的 base64，压缩在语义上也不会碰它（缓存前缀要原样保留），
+    但压缩路径会先 json 深拷贝 + 再解析一次，纯属白搬几 MB。这里直接跳过。
+    """
+    messages = parsed_body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _IMAGE_CONTENT_TYPES:
+                    return True
+    items = parsed_body.get("input")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in _IMAGE_CONTENT_TYPES:
+                return True
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _IMAGE_CONTENT_TYPES:
+                    return True
+    return False
+
+
 def _should_compress(method: str, path: str, parsed_body: dict) -> bool:
     if not headroom_enabled():
         return False
     if (method or "").upper() not in {"POST", "PUT"}:
         return False
     if not isinstance(parsed_body, dict):
+        return False
+    if _has_image_part(parsed_body):
         return False
     if is_image_path(path) or is_audio_path(path) or is_audio_chat_completion(path, parsed_body.get("model")) or not is_billable_path(path):
         return False

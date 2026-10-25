@@ -686,6 +686,7 @@ async def reload_cache_from_db() -> None:
                 "cost_rate": getattr(vendor, "cost_rate", None),
                 "catalog_policy": getattr(vendor, "catalog_policy", None),
                 "profit_multiplier": getattr(vendor, "profit_multiplier", None),
+                "cost_usd_cny_rate": getattr(vendor, "cost_usd_cny_rate", None),
                 "is_default": bool(vendor.is_default),
                 "is_active": bool(vendor.is_active),
                 "sort_order": vendor.sort_order,
@@ -792,6 +793,25 @@ def vendor_profit_multiplier(vendor: str = "", fallback: Optional[float] = None)
     except (TypeError, ValueError):
         pass
     return float(PROFIT_MULTIPLIER)
+
+
+def vendor_cost_usd_cny_rate(vendor: str = "", fallback: Optional[float] = None) -> Optional[float]:
+    """供应商真实采购汇率（如 teamo 6.9）；未设置或非法时回落 fallback（通常全局 usd_cny_rate）。"""
+    meta = resolve_vendor(vendor=vendor) if vendor else resolve_vendor()
+    raw = (meta or {}).get("cost_usd_cny_rate")
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    try:
+        fallback_value = float(fallback)
+        if fallback_value > 0:
+            return fallback_value
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _mask_api_key(key: str) -> str:
@@ -1104,6 +1124,7 @@ def list_vendors(*, include_pricing_meta: bool = False) -> list[dict]:
             item.pop("cost_rate", None)
             item.pop("catalog_policy", None)
             item.pop("profit_multiplier", None)
+            item.pop("cost_usd_cny_rate", None)
             item.pop("keys", None)
         items.append(item)
     return items
@@ -1414,6 +1435,11 @@ async def pricing_supervisor(stop_event: asyncio.Event) -> None:
         except Exception:
             process_log.exception("reload model routes in supervisor failed")
         try:
+            from utils.user_price import reload_user_prices
+            await reload_user_prices()
+        except Exception:
+            process_log.exception("reload user model prices in supervisor failed")
+        try:
             from utils.model_protocol import reload_protocols
             await reload_protocols()
         except Exception:
@@ -1486,6 +1512,7 @@ async def create_or_update_vendor(
     cost_rate: Optional[float] = None,
     catalog_policy: Any = None,
     profit_multiplier: Optional[float] = None,
+    cost_usd_cny_rate: Optional[float] = None,
     api_key: Optional[str] = None,
     is_active: bool = True,
     is_default: bool = False,
@@ -1514,6 +1541,13 @@ async def create_or_update_vendor(
     if mode == PRICING_MODE_CATALOG_RATE:
         # 目录倍率模式不走远程价目拉取，避免被 sync 覆盖
         pricing_url = None
+    # 成本汇率：None 表示不动（沿用旧值）；空串/null 显式清空回落全局。
+    COST_RATE_UNSET = object()
+    cost_usd_cny_value: Any = COST_RATE_UNSET
+    if cost_usd_cny_rate is not None and cost_usd_cny_rate != "":
+        cost_usd_cny_value = float(cost_usd_cny_rate)
+        if cost_usd_cny_value <= 0 or cost_usd_cny_value > 100:
+            raise ValueError("cost_usd_cny_rate must be > 0 and <= 100")
 
     prev_mode = None
     prev_rate = None
@@ -1539,6 +1573,10 @@ async def create_or_update_vendor(
         row.cost_rate = rate_value if mode == PRICING_MODE_CATALOG_RATE else None
         row.catalog_policy = stored_policy
         row.profit_multiplier = profit_value
+        if cost_usd_cny_value is not COST_RATE_UNSET:
+            row.cost_usd_cny_rate = cost_usd_cny_value
+        elif row.id is None:
+            row.cost_usd_cny_rate = None
         if api_key is not None:
             row.api_key = (api_key or "").strip() or None
         row.is_active = bool(is_active)
@@ -1577,6 +1615,7 @@ async def create_or_update_vendor(
         "pricing_mode": mode,
         "cost_rate": rate_value,
         "catalog_policy": stored_policy,
+        "cost_usd_cny_rate": None if cost_usd_cny_value is COST_RATE_UNSET else cost_usd_cny_value,
     }
     return redact_vendor_meta(meta, admin=True)
 
@@ -1590,9 +1629,11 @@ async def ensure_vendor_schema_columns(conn) -> None:
         "ALTER TABLE tb_upstream_vendor ADD COLUMN api_key VARCHAR(512) NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN key_migration_done TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN catalog_policy JSON NULL",
+        "ALTER TABLE tb_upstream_vendor ADD COLUMN cost_usd_cny_rate DOUBLE NULL",
         "ALTER TABLE tb_model_route ADD COLUMN api_key VARCHAR(512) NULL",
         "ALTER TABLE tb_model_route ADD COLUMN api_key_id INT NULL",
         "ALTER TABLE tb_model_route ADD COLUMN user_ids JSON NULL",
+        "ALTER TABLE tb_model_route ADD COLUMN group_name VARCHAR(128) NOT NULL DEFAULT ''",
         "ALTER TABLE tb_user ADD COLUMN phone_key_revoked TINYINT(1) NOT NULL DEFAULT 0",
         "UPDATE tb_user u SET phone_key_revoked = 1 WHERE phone_key_revoked = 0 AND EXISTS (SELECT 1 FROM tb_user_api_key k WHERE k.user_id = u.user_id)",
         "ALTER TABLE tb_vendor_model_price ADD COLUMN original_input_price DOUBLE NULL",

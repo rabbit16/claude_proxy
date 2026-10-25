@@ -3,8 +3,6 @@ import re
 import struct
 from typing import Any, Dict, Optional, Tuple
 
-from sqlalchemy import select
-
 from settings.database import AsyncSessionLocal
 from settings.macro import (
     CACHE_READ_MULTIPLIER,
@@ -15,9 +13,11 @@ from settings.macro import (
     TEAMO_IMAGE_MODEL_MONEY_DICT,
     TEAMO_MODEL_ALIASES,
 )
-from settings.models import User
+from utils.api_key_auth import resolve_billing_user
 from utils.check_user import billing_timing, invalidate_user_auth, normalize_model_name
+from utils.user_price import match_user_price
 from utils.request_usage import apply_billed_usage
+from utils.task_guard import finish_writes
 from utils.get_log import billing_log
 
 
@@ -301,6 +301,7 @@ def calc_image_charge(
     discount: float = 1,
     profit_multiplier: float = PROFIT_MULTIPLIER,
     usd_cny_rate: float = DOR2CHY,
+    cost_usd_cny_rate: Optional[float] = None,
     size_tier: str = "",
     width: Any = None,
     height: Any = None,
@@ -327,7 +328,8 @@ def calc_image_charge(
         if unit <= 0 and not (text_tokens or image_input_tokens or output_tokens):
             return None
         usd_cost = n * unit
-        cost_cny = usd_cost * usd_cny_rate
+        cost_rate = float(cost_usd_cny_rate or usd_cny_rate)
+        cost_cny = usd_cost * cost_rate
         charged = usd_cost * profit_multiplier * usd_cny_rate * (money_rate or 1) * (discount or 1)
         return {
             "kind": "image",
@@ -348,6 +350,7 @@ def calc_image_charge(
             "profit": charged - cost_cny,
             "multiplier": profit_multiplier,
             "usd_cny_rate": usd_cny_rate,
+            "cost_usd_cny_rate": cost_rate,
             "cache_read_multiplier": CACHE_READ_MULTIPLIER,
         }
 
@@ -364,7 +367,8 @@ def calc_image_charge(
         + image_input_tokens / 1_000_000 * image_in_price
         + output_tokens / 1_000_000 * out_price
     )
-    cost_cny = usd_cost * usd_cny_rate
+    cost_rate = float(cost_usd_cny_rate or usd_cny_rate)
+    cost_cny = usd_cost * cost_rate
     charged = usd_cost * profit_multiplier * usd_cny_rate * (money_rate or 1) * (discount or 1)
     return {
         "kind": "image",
@@ -383,6 +387,7 @@ def calc_image_charge(
         "profit": charged - cost_cny,
         "multiplier": profit_multiplier,
         "usd_cny_rate": usd_cny_rate,
+        "cost_usd_cny_rate": cost_rate,
         "cache_read_multiplier": CACHE_READ_MULTIPLIER,
     }
 
@@ -408,6 +413,10 @@ def parse_multipart_fields(body: bytes, content_type: str) -> dict:
         if not name_match or re.search(r"filename=", header_text, re.I):
             continue
         name = name_match.group(1)
+        # 只要表单文本字段（model/n/size 等）。图片/音频文件块可能有几十 MB，
+        # 这里只用来取计费参数，不值得整块 decode 成 str。
+        if len(data) > 8192:
+            continue
         value = data.rstrip(b"\r\n-").decode(errors="ignore").strip()
         if name == "n":
             parsed = _to_int(value)
@@ -454,80 +463,115 @@ async def compute_image_charge(
             if isinstance(image_cfg, dict):
                 request_size = image_cfg.get("imageSize") or image_cfg.get("image_size")
     from utils.pricing import get_pricing_config
-    from utils.vendor_catalog import vendor_profit_multiplier
-    pricing_config = await get_pricing_config()
-    profit_multiplier = vendor_profit_multiplier(vendor, pricing_config.profit_multiplier)
-    summary = calc_image_charge(
-        text_tokens=usage.get("text_tokens") or 0,
-        image_input_tokens=usage.get("image_input_tokens") or 0,
-        output_tokens=usage.get("output_tokens") or 0,
-        n=n,
-        prices=prices,
-        profit_multiplier=profit_multiplier,
-        usd_cny_rate=pricing_config.usd_cny_rate,
-        size_tier=usage.get("size_tier") or "",
-        width=usage.get("width"),
-        height=usage.get("height"),
-        request_size=request_size,
-    )
-    if not summary:
-        billing_log.warning(
-            "skip req=%s user=%s source=%s model=%s reason=no_image_usage",
-            req_id,
-            user_id,
-            source,
-            model or "-",
-        )
-        return None
+    from utils.vendor_catalog import vendor_cost_usd_cny_rate, vendor_profit_multiplier
+    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
+    user_price = match_user_price(model, user_key=user_id)
+    if user_price:
+        tiers = user_price.get("per_image_tiers")
+        prices = {
+            "kind": "image",
+            "billing": "per_image" if tiers else "token",
+            "text_input": user_price["text_input"],
+            "image_input": user_price["image_input"],
+            "output": user_price["output"],
+            "text_cache": 0,
+            **({"per_image_tiers": {str(k).lower(): float(v or 0) for k, v in tiers.items()}} if tiers else {}),
+        }
+    summary = None
 
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User).filter_by(telephone=user_id))
-        user = result.scalars().first()
-        if not user:
-            billing_log.warning(
-                "skip req=%s user=%s source=%s model=%s reason=user_missing",
-                req_id,
-                user_id,
-                source,
-                model or "-",
+    async def write():
+        nonlocal summary
+        async with AsyncSessionLocal() as db:
+            pricing_config = await get_pricing_config(db)
+            profit_multiplier = 1.0 if user_price else vendor_profit_multiplier(
+                vendor, pricing_config.profit_multiplier,
             )
-            return None
-        money_rate = user.money_rate or 1
-        discount = user.discount or 1
-        if money_rate != 1 or discount != 1:
+            cost_rate = vendor_cost_usd_cny_rate(vendor, pricing_config.usd_cny_rate)
             summary = calc_image_charge(
-                text_tokens=summary["text_tokens"],
-                image_input_tokens=summary["image_input_tokens"],
-                output_tokens=summary["output_tokens"],
-                n=summary["n"],
+                text_tokens=usage.get("text_tokens") or 0,
+                image_input_tokens=usage.get("image_input_tokens") or 0,
+                output_tokens=usage.get("output_tokens") or 0,
+                n=n,
                 prices=prices,
-                money_rate=money_rate,
-                discount=discount,
-                profit_multiplier=summary["multiplier"],
-                usd_cny_rate=summary["usd_cny_rate"],
-                size_tier=summary.get("size_tier") or usage.get("size_tier") or "",
+                profit_multiplier=profit_multiplier,
+                usd_cny_rate=pricing_config.usd_cny_rate,
+                cost_usd_cny_rate=cost_rate,
+                size_tier=usage.get("size_tier") or "",
                 width=usage.get("width"),
                 height=usage.get("height"),
                 request_size=request_size,
             )
             if not summary:
-                return None
-        summary["model"] = model
-        summary["cache_read_tokens"] = int(usage.get("cache_read_tokens") or 0)
-        summary["cache_write_tokens"] = int(usage.get("cache_write_tokens") or 0)
-        remain_before = user.token or 0
-        user.token = remain_before - summary["charged"]
-        summary["remain"] = user.token
-        user.input_token = (user.input_token or 0) + summary["input_tokens"]
-        user.output_token = (user.output_token or 0) + summary["output_tokens"]
-        await apply_billed_usage(db, req_id, summary)
-        await db.commit()
-        if summary["remain"] <= 0:
-            invalidate_user_auth(user_id)
+                billing_log.warning(
+                    "skip req=%s user=%s source=%s model=%s reason=no_image_usage",
+                    req_id,
+                    user_id,
+                    source,
+                    model or "-",
+                )
+                return False
+            user = await resolve_billing_user(db, user_id)
+            if not user:
+                billing_log.warning(
+                    "skip req=%s user=%s source=%s model=%s reason=user_missing",
+                    req_id,
+                    user_id,
+                    source,
+                    model or "-",
+                )
+                return False
+            money_rate = 1.0 if user_price else (user.money_rate or 1)
+            discount = 1.0 if user_price else (user.discount or 1)
+            if user_price or money_rate != 1 or discount != 1:
+                if user_price:
+                    summary["multiplier"] = 1.0
+                summary = calc_image_charge(
+                    text_tokens=summary["text_tokens"],
+                    image_input_tokens=summary["image_input_tokens"],
+                    output_tokens=summary["output_tokens"],
+                    n=summary["n"],
+                    prices=prices,
+                    money_rate=money_rate,
+                    discount=discount,
+                    profit_multiplier=summary["multiplier"],
+                    usd_cny_rate=summary["usd_cny_rate"],
+                    cost_usd_cny_rate=summary.get("cost_usd_cny_rate"),
+                    size_tier=summary.get("size_tier") or usage.get("size_tier") or "",
+                    width=usage.get("width"),
+                    height=usage.get("height"),
+                    request_size=request_size,
+                )
+                if not summary:
+                    return False
+            summary["model"] = model
+            summary["cache_read_tokens"] = int(usage.get("cache_read_tokens") or 0)
+            summary["cache_write_tokens"] = int(usage.get("cache_write_tokens") or 0)
+            remain_before = user.token or 0
+            user.token = remain_before - summary["charged"]
+            summary["remain"] = user.token
+            user.input_token = (user.input_token or 0) + summary["input_tokens"]
+            user.output_token = (user.output_token or 0) + summary["output_tokens"]
+            await apply_billed_usage(db, req_id, summary)
+            await db.commit()
+            if summary["remain"] <= 0:
+                invalidate_user_auth(user_id)
+            # 日志放进写库任务内：调用方在客户端断开时会抛取消，
+            # 放在写库后面会跳过这行，出现已扣费但 billing.log 无记录。
+            _log_billed(req_id, user_id, source, model, summary, money_rate, discount,
+                        started, first_byte_at)
+            return True
 
+    if not await finish_writes(write):
+        return None
+
+    return summary
+
+
+def _log_billed(req_id, user_id, source, model, summary, money_rate, discount,
+                started, first_byte_at):
     ttfb_ms, done_ms = billing_timing(started, first_byte_at)
     billing_log.info(
-        "ok req=%s user=%s source=%s model=%s billing=%s tier=%s text=%s image_in=%s out=%s n=%s spent=%.6f profit=%.6f remain=%.6f usd=%.6f multiplier=%s fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
+        "ok req=%s user=%s source=%s model=%s billing=%s tier=%s text=%s image_in=%s out=%s n=%s spent=%.6f cost=%.6f profit=%.6f remain=%.6f usd=%.6f multiplier=%s fx=%s cost_fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
         req_id,
         user_id,
         source,
@@ -539,14 +583,15 @@ async def compute_image_charge(
         summary["output_tokens"],
         summary["n"],
         summary["charged"],
+        summary.get("cost_cny") or 0.0,
         summary["profit"],
         summary["remain"],
         summary["usd_cost"],
         summary["multiplier"],
         summary["usd_cny_rate"],
+        summary.get("cost_usd_cny_rate") or summary["usd_cny_rate"],
         money_rate,
         discount,
         ttfb_ms,
         done_ms,
     )
-    return summary

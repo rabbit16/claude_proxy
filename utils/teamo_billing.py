@@ -14,14 +14,13 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote
 
-from sqlalchemy import select
-
 from settings.database import AsyncSessionLocal
 from settings.macro import DOR2CHY, TEAMO_HTTP_PROXY, TEAMO_UPSTREAM_BASE, _load_teamo_api_key
-from settings.models import User
+from utils.api_key_auth import resolve_billing_user
 from utils.check_user import billing_timing, invalidate_user_auth
 from utils.get_log import billing_audit_log, billing_log, process_log
 from utils.request_usage import apply_billed_usage
+from utils.task_guard import finish_writes
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -198,13 +197,15 @@ def calc_teamo_pass_through(
     usd_cny_rate: float,
     money_rate: float = 1,
     discount: float = 1,
+    cost_usd_cny_rate: Optional[float] = None,
 ) -> dict:
     usd_cost = float(usd_cost or 0)
     profit_multiplier = float(profit_multiplier or 0)
     usd_cny_rate = float(usd_cny_rate or DOR2CHY)
+    cost_rate = float(cost_usd_cny_rate or usd_cny_rate)
     money_rate = float(money_rate or 1)
     discount = float(discount or 1)
-    cost_cny = usd_cost * usd_cny_rate
+    cost_cny = usd_cost * cost_rate
     charged = usd_cost * profit_multiplier * usd_cny_rate * money_rate * discount
     return {
         "usd_cost": usd_cost,
@@ -213,6 +214,7 @@ def calc_teamo_pass_through(
         "profit": charged - cost_cny,
         "multiplier": profit_multiplier,
         "usd_cny_rate": usd_cny_rate,
+        "cost_usd_cny_rate": cost_rate,
         "billing_source": "teamo_request",
     }
 
@@ -296,53 +298,82 @@ async def charge_from_teamo_bill(
         return None
     body = body or {}
     usage = usage or {}
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User).filter_by(telephone=user_id))
-        user = result.scalars().first()
-        if not user:
-            billing_log.warning(
-                "skip req=%s user=%s source=%s reason=user_missing teamo_request=%s",
-                req_id, user_id, source, bill.get("request_id") or "-",
+    summary = None
+    money_rate = 1
+    discount = 1
+
+    async def write():
+        nonlocal summary, money_rate, discount
+        async with AsyncSessionLocal() as db:
+            user = await resolve_billing_user(db, user_id)
+            if not user:
+                billing_log.warning(
+                    "skip req=%s user=%s source=%s reason=user_missing teamo_request=%s",
+                    req_id, user_id, source, bill.get("request_id") or "-",
+                )
+                return False
+            from utils.pricing import get_pricing_config
+            from utils.vendor_catalog import vendor_profit_multiplier, vendor_cost_usd_cny_rate
+            from utils.user_price import match_user_price
+            pricing_config = await get_pricing_config(db)
+            money_rate = user.money_rate or 1
+            discount = user.discount or 1
+            cost_rate = vendor_cost_usd_cny_rate(vendor, pricing_config.usd_cny_rate)
+            summary = calc_teamo_pass_through(
+                bill["usd_cost"],
+                profit_multiplier=vendor_profit_multiplier(vendor, pricing_config.profit_multiplier),
+                usd_cny_rate=pricing_config.usd_cny_rate,
+                money_rate=money_rate,
+                discount=discount,
+                cost_usd_cny_rate=cost_rate,
             )
-            return None
-        from utils.pricing import get_pricing_config
-        from utils.vendor_catalog import vendor_profit_multiplier
-        pricing_config = await get_pricing_config(db)
-        money_rate = user.money_rate or 1
-        discount = user.discount or 1
-        summary = calc_teamo_pass_through(
-            bill["usd_cost"],
-            profit_multiplier=vendor_profit_multiplier(vendor, pricing_config.profit_multiplier),
-            usd_cny_rate=pricing_config.usd_cny_rate,
-            money_rate=money_rate,
-            discount=discount,
-        )
-        input_tokens = int(bill.get("input_tokens") or usage.get("input_tokens") or 0)
-        output_tokens = int(bill.get("output_tokens") or usage.get("output_tokens") or 0)
-        cache_read = int(bill.get("cache_read_tokens") or usage.get("cache_read_tokens") or 0)
-        cache_write = int(bill.get("cache_write_tokens") or usage.get("cache_write_tokens") or 0)
-        summary.update({
-            "model": body.get("model") or bill.get("model") or "",
-            "kind": kind,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_tokens": cache_read,
-            "cache_write_tokens": cache_write,
-            "audio_input_tokens": int(usage.get("audio_input_tokens") or 0),
-            "audio_output_tokens": int(usage.get("audio_output_tokens") or 0),
-            "teamo_request_id": bill.get("request_id") or "",
-            "teamo_amount": bill.get("usd_cost"),
-            "teamo_currency": bill.get("currency") or "USD",
-        })
-        remain_before = user.token or 0
-        user.token = remain_before - summary["charged"]
-        summary["remain"] = user.token
-        user.input_token = (user.input_token or 0) + input_tokens + cache_read + cache_write
-        user.output_token = (user.output_token or 0) + output_tokens
-        await apply_billed_usage(db, req_id, summary)
-        await db.commit()
-        if summary["remain"] <= 0:
-            invalidate_user_auth(user_id)
+            # 用户专属价：官方账单 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
+            model_name = body.get("model") or bill.get("model") or ""
+            user_price = match_user_price(model_name, user_key=user_id)
+            if user_price:
+                summary = calc_teamo_pass_through(
+                    bill["usd_cost"],
+                    profit_multiplier=1.0,
+                    usd_cny_rate=pricing_config.usd_cny_rate,
+                    money_rate=1.0,
+                    discount=1.0,
+                    cost_usd_cny_rate=cost_rate,
+                )
+                summary["billing_basis"] = "user_price"
+            input_tokens = int(bill.get("input_tokens") or usage.get("input_tokens") or 0)
+            output_tokens = int(bill.get("output_tokens") or usage.get("output_tokens") or 0)
+            cache_read = int(bill.get("cache_read_tokens") or usage.get("cache_read_tokens") or 0)
+            cache_write = int(bill.get("cache_write_tokens") or usage.get("cache_write_tokens") or 0)
+            summary.update({
+                "model": body.get("model") or bill.get("model") or "",
+                "kind": kind,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "audio_input_tokens": int(usage.get("audio_input_tokens") or 0),
+                "audio_output_tokens": int(usage.get("audio_output_tokens") or 0),
+                "teamo_request_id": bill.get("request_id") or "",
+                "teamo_amount": bill.get("usd_cost"),
+                "teamo_currency": bill.get("currency") or "USD",
+            })
+            remain_before = user.token or 0
+            user.token = remain_before - summary["charged"]
+            summary["remain"] = user.token
+            user.input_token = (user.input_token or 0) + input_tokens + cache_read + cache_write
+            user.output_token = (user.output_token or 0) + output_tokens
+            await apply_billed_usage(db, req_id, summary)
+            await db.commit()
+            if summary["remain"] <= 0:
+                invalidate_user_auth(user_id)
+            # 日志放进写库任务内：调用方在客户端断开时会抛取消，
+            # 放在写库后面会跳过这行，出现已扣费但 billing.log 无记录。
+            _log_billed(req_id, user_id, source, summary, money_rate, discount,
+                        started, first_byte_at)
+            return True
+
+    if not await finish_writes(write):
+        return None
 
     try:
         audit_teamo_charge(
@@ -370,9 +401,14 @@ async def charge_from_teamo_bill(
         )
     except Exception:
         process_log.exception("teamo official reconcile failed req=%s", req_id)
+    return summary
+
+
+def _log_billed(req_id, user_id, source, summary, money_rate, discount,
+                started, first_byte_at):
     ttfb_ms, done_ms = billing_timing(started, first_byte_at)
     billing_log.info(
-        "ok req=%s user=%s source=%s model=%s in=%s cache_read=%s cache_write=%s out=%s teamo_request=%s usd=%.6f spent=%.6f profit=%.6f remain=%.6f multiplier=%s fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
+        "ok req=%s user=%s source=%s model=%s in=%s cache_read=%s cache_write=%s out=%s teamo_request=%s usd=%.6f cost=%.6f spent=%.6f profit=%.6f remain=%.6f multiplier=%s fx=%s cost_fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
         req_id,
         user_id,
         source,
@@ -383,17 +419,18 @@ async def charge_from_teamo_bill(
         summary.get("output_tokens") or 0,
         summary.get("teamo_request_id") or "-",
         summary["usd_cost"],
+        summary.get("cost_cny") or 0.0,
         summary["charged"],
         summary["profit"],
         summary["remain"],
         summary["multiplier"],
         summary["usd_cny_rate"],
+        summary.get("cost_usd_cny_rate") or summary["usd_cny_rate"],
         money_rate,
         discount,
         ttfb_ms,
         done_ms,
     )
-    return summary
 
 
 _BALANCE_TTL = 45.0

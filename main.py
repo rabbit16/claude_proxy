@@ -113,6 +113,7 @@ from settings.models import (
     UpstreamVendor,
     UpstreamVendorKey,
     UserApiKey,
+    UserModelPrice,
     VendorModelPrice,
 )
 from utils.pricing import ensure_pricing_settings, get_pricing_config, update_pricing_settings
@@ -147,7 +148,7 @@ from utils.vendor_catalog import (
     vendor_resolved_api_key,
     PRICING_MODE_CATALOG_RATE,
 )
-from utils.api_key_auth import lookup_user_by_credential, phone_blocked_for_model
+from utils.api_key_auth import billing_key_for_user, lookup_user_by_credential, phone_blocked_for_model
 from utils.check_user import extract_user_key
 from utils.model_route import (
     delete_route,
@@ -157,6 +158,14 @@ from utils.model_route import (
     replace_route_api_keys,
     resolve_runtime_for_model,
     upsert_route,
+)
+from utils.user_price import (
+    apply_user_price_to_catalog,
+    delete_user_price,
+    list_user_prices,
+    match_user_price,
+    reload_user_prices,
+    upsert_user_price,
 )
 from utils.model_rewrite import (
     apply_model_rewrite,
@@ -231,8 +240,14 @@ UPSTREAM_RETRY_SLEEP = 1.0
 UPSTREAM_RETRY_STATUSES = {502}
 # 读超时只切断长时间没有任何字节的连接。正常流式输出会不断重置这只计时器。
 UPSTREAM_READ_TIMEOUT = 300.0
+# 写超时按「单次 send」计，而 httpx 对 bytes body 只发一次，等于整包上传的预算。
+# 19MB 的 agent 上下文在 320KB/s 上行下要 60s，旧的 60s 正好卡在阈值上。
+UPSTREAM_WRITE_TIMEOUT = float(os.environ.get("UPSTREAM_WRITE_TIMEOUT") or 300.0)
 UPSTREAM_POOL_TIMEOUT = 15.0
 UPSTREAM_CLOSE_TIMEOUT = 5.0
+# 超过该体积的请求体，写超时后不再重试：重传等于把同样的数据再搬一遍，
+# 只会继续占满上行、把客户端多挂几分钟。
+UPSTREAM_LARGE_BODY_BYTES = 4 * 1024 * 1024
 # DeepSeek 首字超过该阈值单独记录到 deepseek_slow.log，便于事后分析慢请求。
 DEEPSEEK_SLOW_TTFB_MS = 10_000
 
@@ -244,11 +259,19 @@ def format_upstream_exc(exc: BaseException) -> str:
     return f"{name}: {text}" if text else name
 
 
-def should_retry_stream_transport(exc: BaseException, attempt: int, client_events: int) -> bool:
-    """已经向客户端输出过内容时不能重试。连接池耗尽时重试也拿不到连接，只会把请求挂在 pending。"""
+def should_retry_stream_transport(
+    exc: BaseException, attempt: int, client_events: int, body_bytes: int = 0,
+) -> bool:
+    """已经向客户端输出过内容时不能重试。连接池耗尽时重试也拿不到连接，只会把请求挂在 pending。
+
+    大请求体的写超时同样不重试：每次重试都要重新上传整包，上行本来就不够，
+    重传只会把这次请求再拖一分钟以上，还挤占其他用户的带宽。
+    """
     if client_events > 0:
         return False
     if isinstance(exc, httpx.PoolTimeout):
+        return False
+    if isinstance(exc, httpx.WriteTimeout) and body_bytes >= UPSTREAM_LARGE_BODY_BYTES:
         return False
     return attempt < UPSTREAM_RETRY_ATTEMPTS
 
@@ -319,13 +342,18 @@ async def _request_upstream_with_retry(
                 )
         except httpx.HTTPError as exc:
             process_log.warning(
-                "upstream request error req=%s attempt=%s/%s err=%s",
+                "upstream request error req=%s attempt=%s/%s bytes=%s err=%s",
                 req_id,
                 attempt,
                 UPSTREAM_RETRY_ATTEMPTS,
-                exc,
+                len(content or b""),
+                format_upstream_exc(exc),
             )
-            if attempt < UPSTREAM_RETRY_ATTEMPTS:
+            large_write_timeout = (
+                isinstance(exc, httpx.WriteTimeout)
+                and len(content or b"") >= UPSTREAM_LARGE_BODY_BYTES
+            )
+            if attempt < UPSTREAM_RETRY_ATTEMPTS and not large_write_timeout:
                 await asyncio.sleep(UPSTREAM_RETRY_SLEEP)
                 continue
             raise
@@ -367,7 +395,7 @@ async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(
         connect=10.0,
         read=UPSTREAM_READ_TIMEOUT,
-        write=60.0,
+        write=UPSTREAM_WRITE_TIMEOUT,
         pool=UPSTREAM_POOL_TIMEOUT,
     )
     limits = httpx.Limits(
@@ -402,6 +430,7 @@ async def lifespan(app: FastAPI):
                 await conn.run_sync(VendorModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(UserApiKey.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRoute.__table__.create, checkfirst=True)
+                await conn.run_sync(UserModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelProtocol.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelAlias.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRewrite.__table__.create, checkfirst=True)
@@ -419,6 +448,7 @@ async def lifespan(app: FastAPI):
         await migrate_vendor_keys()
         await reload_cache_from_db()
         await reload_routes()
+        await reload_user_prices()
         await reload_protocols()
         await reload_aliases()
         await reload_rewrites()
@@ -601,6 +631,112 @@ def _log_access(
         parts.append(extra)
     access_log.info(" ".join(parts))
     schedule_agent_task(req_id=req_id, finish=finish, result=result, http_status=status)
+
+
+# 这些供应商的 chat/completions 端点无论请求里 stream 写什么，都只回 SSE，
+# 且非流式模式下 choices 为空。非流式请求需要先按流式要数据，再聚合成普通 JSON。
+_FAKE_NON_STREAM_VENDORS = {
+    item.strip().lower()
+    for item in (os.environ.get("FAKE_NON_STREAM_VENDORS", "tongtong") or "").split(",")
+    if item.strip()
+}
+
+
+def needs_fake_non_stream(vendor: str) -> bool:
+    return (vendor or "").strip().lower() in _FAKE_NON_STREAM_VENDORS
+
+
+def non_stream_chunk_to_completion(
+    chunks: list[dict], *, fallback_model: str = ""
+) -> Optional[dict]:
+    """把 chat.completion.chunk 序列拼成 chat.completion。
+
+    返回 None 表示这些 chunk 不足以还原成一次正常应答（例如上游只回了空 choices
+    的用量块），调用方应保留原始响应，避免把错误伪装成成功。
+    """
+    if not chunks:
+        return None
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    finish_reason = None
+    completion_id = ""
+    created = 0
+    model_name = ""
+    system_fingerprint = ""
+    usage: dict = {}
+    saw_choice = False
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("id"):
+            completion_id = chunk["id"]
+        if chunk.get("created"):
+            created = chunk["created"]
+        if chunk.get("model"):
+            model_name = chunk["model"]
+        if chunk.get("system_fingerprint"):
+            system_fingerprint = chunk["system_fingerprint"]
+        # 上游把 usage 放在最后一个 chunk，且不保证每块都带
+        if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+            usage = chunk["usage"]
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        saw_choice = True
+        choice = choices[0] or {}
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        if delta.get("content"):
+            content_parts.append(str(delta["content"]))
+        if delta.get("reasoning_content"):
+            reasoning_parts.append(str(delta["reasoning_content"]))
+        for call in delta.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            index = call.get("index")
+            if not isinstance(index, int):
+                index = len(tool_calls)
+            item = tool_calls.setdefault(
+                index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if call.get("id"):
+                item["id"] = call["id"]
+            function = call.get("function") if isinstance(call.get("function"), dict) else {}
+            if function.get("name"):
+                item["function"]["name"] += str(function["name"])
+            if function.get("arguments"):
+                item["function"]["arguments"] += str(function["arguments"])
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+    if not saw_choice:
+        return None
+    message: dict = {"role": "assistant", "content": "".join(content_parts)}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    if message["content"] == "" and not tool_calls:
+        message["content"] = None
+    out: dict = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model_name or fallback_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "logprobs": None,
+                "finish_reason": finish_reason or "stop",
+            }
+        ],
+    }
+    if system_fingerprint:
+        out["system_fingerprint"] = system_fingerprint
+    if usage:
+        out["usage"] = usage
+    return out
 
 
 def is_deepseek_model(model: str) -> bool:
@@ -1068,11 +1204,15 @@ async def log_and_forward_requests(request: Request, call_next):
         )
     # 仅号商模式：标准名 → -hc。本地 LiteLLM 模式不覆盖模型。
     # count_tokens 固定交给 Teamo，模型名按 Teamo 别名映射，不套用云信 -hc。
+    # 这里只改 parsed_body，序列化推迟到转发前：中间步骤还会改 model、清字段，
+    # 每一步都重 dump 一次的话，带图请求要白搬好几遍几 MB 的 base64。
+    pending_body_rewrite = False
     body, parsed_body = apply_upstream_model_to_request(
         body,
         parsed_body,
         teamo=True if count_tokens_route else runtime_teamo,
         yunxin=False if count_tokens_route else runtime_yunxin,
+        serialize=False,
     )
     # Teamo/号商 chat：非 Cursor 也要清洗（stream_options / max_completion_tokens 等易 422）
     if (
@@ -1297,6 +1437,37 @@ async def log_and_forward_requests(request: Request, call_next):
     # Anthropic/Responses 桥接后不要把原 query 原样带给目标端点
     if request.url.query and not anthropic_bridge and not responses_bridge and not protocol_adapt:
         target_url += f"?{request.url.query}"
+    # 部分供应商的 chat/completions 只出 SSE：非流式请求改按流式取数，下面聚合后
+    # 再以普通 JSON 返回。只处理原生 chat 协议，桥接路径各自已有完整转换。
+    fake_non_stream = bool(
+        not want_stream
+        and not count_tokens_route
+        and not anthropic_bridge
+        and not responses_bridge
+        and not protocol_adapt
+        and source == "openai"
+        and needs_fake_non_stream(runtime_vendor)
+        and upstream_path.rstrip("/").endswith("/chat/completions")
+        and not is_audio_path(request.url.path)
+        and not is_image_path(request.url.path)
+        and not is_gemini_native_path(request.url.path)
+    )
+    if fake_non_stream:
+        parsed_body = dict(parsed_body)
+        parsed_body["stream"] = True
+        if "stream_options" in parsed_body and isinstance(parsed_body["stream_options"], dict):
+            parsed_body["stream_options"] = dict(parsed_body["stream_options"])
+            parsed_body["stream_options"]["include_usage"] = True
+        else:
+            parsed_body["stream_options"] = {"include_usage": True}
+        pending_body_rewrite = True
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+        process_log.info("fake non-stream req=%s vendor=%s model=%s", req_id, runtime_vendor, model)
+    if pending_body_rewrite:
+        # 所有改写（别名、模型名、清洗字段）已合并到 parsed_body，这里统一写一次。
+        # 未带 Content-Length 的原样保留客户端字节，缓存前缀不受影响。
+        body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
     process_log.info(
         "forward req=%s user=%s url=%s source=%s model=%s upstream_model=%s bridge=%s resp_bridge=%s cursor=%s keys=%s",
         req_id,
@@ -1314,6 +1485,9 @@ async def log_and_forward_requests(request: Request, call_next):
     client: httpx.AsyncClient = (
         request.app.state.http_teamo if (runtime_teamo or count_tokens_route) else request.app.state.http
     )
+    # 伪非流式聚合结果，非流式分支和日志都要用，放在请求级作用域。
+    fake_chunks: list[dict] = []
+    fake_raw = b""
     async def stream_response():
         collector = StreamUsageCollector()
         billed = False
@@ -2043,7 +2217,9 @@ async def log_and_forward_requests(request: Request, call_next):
                                 await charge_once(leftover_usage)
                         access_stream(status=502, extra="result=incomplete_stream_error")
                         return
-                    if not should_retry_stream_transport(exc, attempt, client_events):
+                    if not should_retry_stream_transport(
+                        exc, attempt, client_events, len(body or b""),
+                    ):
                         raise
                     retry_stream = True
 
@@ -2124,6 +2300,33 @@ async def log_and_forward_requests(request: Request, call_next):
                 parsed_body=parsed_body,
             )
         parsed_resp = _parse_json_body(resp.content)
+        if fake_non_stream and resp.status_code < 400:
+            # 上游按流式返回，这里读完整个 SSE 再拼成普通 completion。
+            raw_parts: list[bytes] = []
+            buf = b""
+            async for chunk in resp.aiter_bytes():
+                raw_parts.append(chunk)
+                buf += chunk
+                events, buf = split_sse_events_bytes(buf)
+                for event_raw in events:
+                    obj = parse_sse_block(event_raw.decode("utf-8", errors="replace"))
+                    if obj:
+                        fake_chunks.append(obj)
+            if buf.strip():
+                obj = parse_sse_block(buf.decode("utf-8", errors="replace"))
+                if obj:
+                    fake_chunks.append(obj)
+            fake_raw = b"".join(raw_parts)
+            parsed_resp = non_stream_chunk_to_completion(
+                fake_chunks, fallback_model=model if model != "-" else ""
+            ) or {}
+            if not parsed_resp:
+                process_log.warning(
+                    "fake non-stream got no content req=%s status=%s body=%s",
+                    req_id,
+                    resp.status_code,
+                    fake_raw[:400].decode(errors="ignore").replace("\n", " "),
+                )
         if resp.status_code >= 400:
             process_log.warning(
                 "upstream error body req=%s status=%s body=%s keys=%s",
@@ -2366,6 +2569,32 @@ async def log_and_forward_requests(request: Request, call_next):
         )
         await finish_request_usage(req_id, resp.status_code, usage)
         out_content = resp.content
+        if fake_non_stream and resp.status_code < 400:
+            if not parsed_resp:
+                # 上游只回了空 choices，聚合不出正常应答。直接报错，别把空 SSE 当成功。
+                message = _extract_upstream_error_message(
+                    fake_raw.decode(errors="ignore"), resp.status_code
+                )
+                _log_access(
+                    request,
+                    req_id=req_id,
+                    user_id=user_id,
+                    source=source,
+                    model=model,
+                    stream=False,
+                    status=502,
+                    started=started,
+                    base_url=upstream_base,
+                    done_ms=_elapsed_ms(started),
+                    extra="result=upstream_empty",
+                    usage=usage,
+                    result="error",
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"type": "api_error", "message": message}},
+                )
+            out_content = json.dumps(parsed_resp, ensure_ascii=False).encode("utf-8")
         if is_models_path(request.url.path) and parsed_resp:
             parsed_resp = apply_aliases_to_models_payload(
                 apply_protocol_to_models_payload(rewrite_models_payload(parsed_resp))
@@ -2386,7 +2615,7 @@ async def log_and_forward_requests(request: Request, call_next):
             started=started,
             base_url=upstream_base,
             done_ms=_elapsed_ms(started),
-            extra=compression_extra,
+            extra=(compression_extra + " fake_non_stream=1").strip() if fake_non_stream else compression_extra,
             usage=usage,
             billing=billing,
             finish=meta.get("finish") or "",
@@ -2395,7 +2624,13 @@ async def log_and_forward_requests(request: Request, call_next):
         return Response(
             content=out_content,
             status_code=resp.status_code,
-            headers=sanitize_headers(dict(resp.headers)),
+            headers=(
+                {k: v for k, v in sanitize_headers(dict(resp.headers)).items()
+                 if k.lower() not in {"content-type", "content-length", "content-encoding"}}
+                if fake_non_stream
+                else sanitize_headers(dict(resp.headers))
+            ),
+            media_type="application/json" if fake_non_stream else None,
         )
     except Exception:
         await finish_request_usage(req_id, 502)
@@ -2430,6 +2665,7 @@ class VendorUpsert(BaseModel):
     cost_rate: Optional[float] = Field(default=None, gt=0, le=100)
     catalog_policy: Optional[dict] = None  # 对外价格档位 + 分类型倍率/展示
     profit_multiplier: Optional[float] = Field(default=None, gt=0, le=100)
+    cost_usd_cny_rate: Optional[float] = Field(default=None, gt=0, le=100)  # 真实采购汇率，仅算成本/利润
     api_key: Optional[str] = Field(default=None, max_length=512)
     is_active: bool = True
     is_default: bool = False
@@ -2474,6 +2710,25 @@ class ModelRouteUpsert(BaseModel):
     api_key_id: Optional[int] = None
     # 不传表示保持原名单；空列表表示全部用户
     user_ids: Optional[list[int]] = None
+    # 分组批量：一条规则一次展开成多条路由；models 优先于 model
+    group_name: Optional[str] = Field(default=None, max_length=128)
+    models: Optional[list[str]] = None
+
+
+class UserModelPriceUpsert(BaseModel):
+    id: Optional[int] = None
+    user_id: int
+    model: str = Field(min_length=1, max_length=255)
+    service_tier: str = "standard"
+    input_price: float = Field(default=0, ge=0)
+    output_price: float = Field(default=0, ge=0)
+    cache_read_price: Optional[float] = Field(default=None, ge=0)
+    cache_write_price: Optional[float] = Field(default=None, ge=0)
+    text_input_price: Optional[float] = Field(default=None, ge=0)
+    image_input_price: Optional[float] = Field(default=None, ge=0)
+    per_image_tiers: Optional[dict] = None
+    is_active: bool = True
+    note: str = ""
 
 
 class ModelRouteKeyReplace(BaseModel):
@@ -2662,6 +2917,26 @@ async def list_current_model_prices(
             "billing_basis": "original" if use_original else "cost",
         }))
 
+    # 专属价按 USD 录入即最终价：命中后覆盖上面的倍率结果，口径只再乘汇率。
+    # 匿名用户没有手机号，专属价按主键匹配（与鉴权给的计费键一致）。
+    price_key = billing_key_for_user(user) or extract_user_key(request) or ""
+    has_user_price = False
+    if price_key:
+        for row in catalog:
+            hit = match_user_price(row.get("model") or "", user_key=price_key,
+                                   service_tier=row.get("service_tier") or "standard")
+            if hit:
+                has_user_price = True
+                break
+    if has_user_price:
+        user_factor = 1.0
+    models = apply_user_price_to_catalog(models, user_key=price_key)
+    images = apply_user_price_to_catalog(images, user_key=price_key)
+    for item in models:
+        if item.get("user_price_id"):
+            item["billing_basis"] = "user_price"
+            item.pop("original_input", None)
+            item.pop("original_output", None)
     model_ids = sorted({item["model"] for item in models})
     return {
         "currency": "USD",
@@ -2741,6 +3016,7 @@ async def admin_upsert_vendor(payload: VendorUpsert, request: Request):
             cost_rate=payload.cost_rate,
             catalog_policy=payload.catalog_policy,
             profit_multiplier=payload.profit_multiplier,
+            cost_usd_cny_rate=payload.cost_usd_cny_rate,
             api_key=payload.api_key,
             is_active=payload.is_active,
             is_default=payload.is_default,
@@ -3043,6 +3319,8 @@ async def admin_upsert_model_route(payload: ModelRouteUpsert, request: Request):
             api_key=payload.api_key,
             api_key_id=payload.api_key_id,
             user_ids=payload.user_ids,
+            group_name=payload.group_name,
+            models=payload.models,
         )
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -3071,6 +3349,51 @@ async def admin_delete_model_route(route_id: int, request: Request):
     if not ok:
         return JSONResponse(status_code=404, content={"error": "route not found"})
     return {"ok": True, "routes": list_routes()}
+
+
+@app.get("/v1/admin/user-model-prices")
+async def admin_list_user_model_prices(request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    return {"prices": list_user_prices()}
+
+
+@app.put("/v1/admin/user-model-prices")
+async def admin_upsert_user_model_price(payload: UserModelPriceUpsert, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        row = await upsert_user_price(
+            user_id=payload.user_id,
+            model=payload.model,
+            service_tier=payload.service_tier,
+            input_price=payload.input_price,
+            output_price=payload.output_price,
+            cache_read_price=payload.cache_read_price,
+            cache_write_price=payload.cache_write_price,
+            text_input_price=payload.text_input_price,
+            image_input_price=payload.image_input_price,
+            per_image_tiers=payload.per_image_tiers,
+            is_active=payload.is_active,
+            note=payload.note,
+            price_id=payload.id,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {"ok": True, "price": row, "prices": list_user_prices()}
+
+
+@app.delete("/v1/admin/user-model-prices/{price_id}")
+async def admin_delete_user_model_price(price_id: int, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    ok = await delete_user_price(price_id)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "price not found"})
+    return {"ok": True, "prices": list_user_prices()}
 
 
 @app.get("/v1/admin/model-rewrites")

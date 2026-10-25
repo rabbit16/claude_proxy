@@ -202,6 +202,8 @@ class UpstreamVendor(Base):
     # 按原始供应商控制展示和倍率。例：{"providers":{"anthropic":{"enabled":true,"cost_rate":0.3},"xai":{"enabled":false}}}
     catalog_policy = Column(JSON, nullable=True)
     profit_multiplier = Column(Float, nullable=True)  # 空则用全局 tb_pricing_settings.profit_multiplier
+    # 真实采购汇率（如 teamo 6.9）。仅用于成本 cost_cny 与利润；客户收费仍用全局 usd_cny_rate。
+    cost_usd_cny_rate = Column(Float, nullable=True)  # 空则用全局 tb_pricing_settings.usd_cny_rate
     is_active = Column(Boolean, nullable=False, default=True)
     is_default = Column(Boolean, nullable=False, default=False)
     sort_order = Column(Integer, nullable=False, default=100)
@@ -236,10 +238,12 @@ class ModelRoute(Base):
 
     user_ids 为空表示全部用户；非空时只有这些用户改走该厂商，计价也用该厂商价目。
     api_key_id 指向 tb_upstream_vendor_key，选择该 vendor 下的某把命名 Key。
+    分组规则（group_name 非空）一次写入多条 model，同组共用同一 vendor / Key / 用户名单。
     """
     __tablename__ = "tb_model_route"
     id = Column(Integer, primary_key=True, autoincrement=True)
     model = Column(String(255), nullable=False, unique=True, index=True)
+    group_name = Column(String(128), nullable=False, default="", index=True)  # 空=单模型规则
     vendor_code = Column(String(64), nullable=False, index=True)
     api_key = Column(String(512), nullable=True)  # 命中该模型时覆盖供应商密钥；空则沿用供应商
     api_key_id = Column(Integer, nullable=True)  # 选指定 vendor Key；与 api_key 互斥
@@ -347,6 +351,34 @@ class VendorModelPrice(Base):
     __table_args__ = (
         UniqueConstraint("vendor_id", "model", "service_tier", name="uq_vendor_model_tier"),
         Index("ix_vendor_model_price_vendor_model", "vendor_id", "model"),
+    )
+
+
+class UserModelPrice(Base):
+    """特定用户的专属模型价（USD / 1M tokens，按张计费模型用 per_image_tiers）。
+
+    命中后该价格就是用户应付价：人民币扣费只再乘汇率，不再叠加上游倍率、
+    用户倍率或折扣。model 支持精确名、- 边界前缀和 gemini* 这类开头通配。
+    """
+    __tablename__ = "tb_user_model_price"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("tb_user.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    model = Column(String(255), nullable=False, index=True)
+    service_tier = Column(String(32), nullable=False, default="standard")
+    input_price = Column(Float, nullable=False, default=0)
+    output_price = Column(Float, nullable=False, default=0)
+    cache_read_price = Column(Float, nullable=False, default=0)
+    cache_write_price = Column(Float, nullable=False, default=0)
+    text_input_price = Column(Float, nullable=False, default=0)
+    image_input_price = Column(Float, nullable=False, default=0)
+    # 按张计费（如图像模型）时的 1k/2k/4k 单价；为空则按 token 计
+    per_image_tiers = Column(JSON, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    note = Column(String(200), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        UniqueConstraint("user_id", "model", "service_tier", name="uq_user_model_price"),
     )
 
 

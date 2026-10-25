@@ -6,6 +6,7 @@ from settings.database import AsyncSessionLocal
 from settings.models import RequestUsage
 from utils.api_key_auth import lookup_user_by_credential
 from utils.get_log import process_log
+from utils.task_guard import finish_writes
 
 LATENCY_WINDOW = 10
 LATENCY_ALERT_MS = 15_000
@@ -13,7 +14,7 @@ LATENCY_LOOKBACK = timedelta(days=7)
 
 
 async def start_request_usage(req_id: str, user_key: str, model: str, path: str, source: str):
-    try:
+    async def write():
         async with AsyncSessionLocal() as db:
             user = await lookup_user_by_credential(db, user_key) if user_key else None
             user_id = user.user_id if user else None
@@ -22,6 +23,9 @@ async def start_request_usage(req_id: str, user_key: str, model: str, path: str,
                 path=path, source=source,
             ))
             await db.commit()
+
+    try:
+        await finish_writes(write)
     except Exception:
         process_log.exception("usage insert failed req=%s", req_id)
 
@@ -117,7 +121,7 @@ async def finish_request_usage(req_id: str, status_code: int, usage: dict = None
     recorded_ttfb = _ttfb_value(ttfb_ms)
     if recorded_ttfb is not None:
         values["ttfb_ms"] = recorded_ttfb
-    try:
+    async def write():
         async with AsyncSessionLocal() as db:
             await db.execute(update(RequestUsage).where(
                 RequestUsage.request_id == req_id,
@@ -130,6 +134,9 @@ async def finish_request_usage(req_id: str, status_code: int, usage: dict = None
                     RequestUsage.ttfb_ms.is_(None),
                 ).values(ttfb_ms=recorded_ttfb))
             await db.commit()
+
+    try:
+        await finish_writes(write)
     except Exception:
         process_log.exception("usage finalize failed req=%s", req_id)
 
@@ -139,12 +146,16 @@ async def retarget_request_usage(req_id: str, model: str) -> None:
     model = (model or "").strip()
     if not req_id or not model or model == "-":
         return
-    try:
+
+    async def write():
         async with AsyncSessionLocal() as db:
             await db.execute(update(RequestUsage).where(
                 RequestUsage.request_id == req_id,
             ).values(model=model[:255]))
             await db.commit()
+
+    try:
+        await finish_writes(write)
     except Exception:
         process_log.exception("usage retarget failed req=%s", req_id)
 

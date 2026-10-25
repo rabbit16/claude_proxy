@@ -3,8 +3,6 @@ import re
 import time
 from typing import Optional
 
-from sqlalchemy import select
-
 from settings.database import AsyncSessionLocal
 from settings.macro import (
     CACHE_READ_MULTIPLIER,
@@ -20,11 +18,17 @@ from settings.macro import (
     LONG_CONTEXT_RULES,
     SERVICE_TIER_MULTIPLIERS,
 )
-from utils.vendor_catalog import get_runtime_upstream, lookup_vendor_price, vendor_profit_multiplier
-from settings.models import User
-from utils.api_key_auth import lookup_user_by_credential
+from utils.vendor_catalog import (
+    get_runtime_upstream,
+    lookup_vendor_price,
+    vendor_cost_usd_cny_rate,
+    vendor_profit_multiplier,
+)
+from utils.api_key_auth import billing_key_for_user, lookup_user_by_credential, resolve_billing_user
 from utils.request_usage import apply_billed_usage
+from utils.task_guard import finish_writes
 from utils.get_log import billing_log, process_log
+from utils.user_price import match_user_price
 
 check_user_log = process_log
 
@@ -227,7 +231,10 @@ async def check_user_message(headers: dict):
     if not user:
         _cache_auth(raw_key, "not exist", _AUTH_NEG_TTL)
         return None, "not exist"
-    telephone = user.telephone or ""
+    telephone = billing_key_for_user(user)
+    if not telephone:
+        _cache_auth(raw_key, "not exist", _AUTH_NEG_TTL)
+        return None, "not exist"
     if user.token is None or user.token <= 0:
         _cache_auth(raw_key, "no money", _AUTH_NEG_TTL, telephone)
         return None, "no money"
@@ -512,6 +519,7 @@ def calc_charge(
     audio_output_price: float = 0,
     profit_multiplier: float = PROFIT_MULTIPLIER,
     usd_cny_rate: float = DOR2CHY,
+    cost_usd_cny_rate: Optional[float] = None,
 ) -> dict:
     usd_cost = calc_token_usd_cost(
         input_tokens,
@@ -527,7 +535,8 @@ def calc_charge(
         audio_input_price=audio_input_price,
         audio_output_price=audio_output_price,
     )
-    cost_cny = usd_cost * usd_cny_rate
+    cost_rate = float(cost_usd_cny_rate or usd_cny_rate)
+    cost_cny = usd_cost * cost_rate
     charged = usd_cost * profit_multiplier * usd_cny_rate * (money_rate or 1) * (discount or 1)
     return {
         "input_tokens": int(input_tokens),
@@ -548,6 +557,7 @@ def calc_charge(
         "profit": charged - cost_cny,
         "multiplier": profit_multiplier,
         "usd_cny_rate": usd_cny_rate,
+        "cost_usd_cny_rate": cost_rate,
         "cache_read_multiplier": CACHE_READ_MULTIPLIER,
         "cache_write_multiplier": CACHE_WRITE_MULTIPLIER,
     }
@@ -614,105 +624,142 @@ async def compute_user_token(
     else:
         billing_prices = apply_service_tier_prices(billing_prices, service_tier)
         cost_prices = apply_service_tier_prices(cost_prices, service_tier)
-    prices = billing_prices
-    cache_read_tokens = int(token_dict.get("cache_read_tokens") or 0)
+        prices = billing_prices
+        cache_read_tokens = int(token_dict.get("cache_read_tokens") or 0)
     cache_write_tokens = int(token_dict.get("cache_write_tokens") or 0)
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User).filter_by(telephone=user_id))
-        user = result.scalars().first()
-        if not user:
-            billing_log.warning(
-                "skip req=%s user=%s source=%s model=%s reason=user_missing",
-                req_id,
-                user_id,
-                source,
-                model or "-",
-            )
-            return None
-        money_rate = user.money_rate or 1
-        discount = user.discount or 1
-        from utils.pricing import get_pricing_config
-        pricing_config = await get_pricing_config(db)
-        profit_multiplier = vendor_profit_multiplier(vendor, pricing_config.profit_multiplier)
-        # 原价模式：1:1 美元转发，人民币只乘汇率；普通模式仍叠加价与用户费率
-        charge_multiplier = 1.0 if use_original else profit_multiplier
-        charge_money_rate = 1.0 if use_original else money_rate
-        charge_discount = 1.0 if use_original else discount
-        summary = calc_charge(
-            token_dict["input_tokens"],
-            token_dict["output_tokens"],
-            prices["input"],
-            prices["output"],
-            money_rate=charge_money_rate,
-            discount=charge_discount,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-            cache_read_price=prices["cache_read"],
-            cache_write_price=prices["cache_write"],
-            audio_input_tokens=int(token_dict.get("audio_input_tokens") or 0),
-            audio_output_tokens=int(token_dict.get("audio_output_tokens") or 0),
-            audio_input_price=prices.get("audio_input", 0.0),
-            audio_output_price=prices.get("audio_output", 0.0),
-            profit_multiplier=charge_multiplier,
-            usd_cny_rate=pricing_config.usd_cny_rate,
+    if use_teamo_prices:
+        prices = billing_prices
+        cache_read_tokens = int(token_dict.get("cache_read_tokens") or 0)
+    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
+    user_price = match_user_price(model, user_key=user_id, service_tier=service_tier)
+    if user_price:
+        prices = resolve_official_prices({
+            "input": user_price["input"],
+            "output": user_price["output"],
+            "cache_read": user_price["cache_read"],
+            "cache_write": user_price["cache_write"],
+        })
+        prices, context_tier = resolve_context_billing(
+            model, prices, token_dict, service_tier=service_tier,
         )
-        if use_original:
-            # 成本/利润仍按上游成本价 × 汇率（与对用户扣费无关）
-            actual_cost_usd = calc_token_usd_cost(
-                summary["input_tokens"],
-                summary["output_tokens"],
-                cost_prices["input"],
-                cost_prices["output"],
+        long_context = context_tier == "long"
+
+    summary = None
+    charge_money_rate = 1
+    charge_discount = 1
+
+    async def write():
+        nonlocal summary, charge_money_rate, charge_discount
+        async with AsyncSessionLocal() as db:
+            user = await resolve_billing_user(db, user_id)
+            if not user:
+                billing_log.warning(
+                    "skip req=%s user=%s source=%s model=%s reason=user_missing",
+                    req_id,
+                    user_id,
+                    source,
+                    model or "-",
+                )
+                return False
+            money_rate = user.money_rate or 1
+            discount = user.discount or 1
+            from utils.pricing import get_pricing_config
+            pricing_config = await get_pricing_config(db)
+            profit_multiplier = vendor_profit_multiplier(vendor, pricing_config.profit_multiplier)
+            cost_rate = vendor_cost_usd_cny_rate(vendor, pricing_config.usd_cny_rate)
+            # 原价 / 用户专属价：1:1 美元计价，人民币只乘汇率；普通模式仍叠加价与用户费率
+            flat_price = use_original or bool(user_price)
+            charge_multiplier = 1.0 if flat_price else profit_multiplier
+            charge_money_rate = 1.0 if flat_price else money_rate
+            charge_discount = 1.0 if flat_price else discount
+            summary = calc_charge(
+                token_dict["input_tokens"],
+                token_dict["output_tokens"],
+                prices["input"],
+                prices["output"],
+                money_rate=charge_money_rate,
+                discount=charge_discount,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
-                cache_read_price=cost_prices["cache_read"],
-                cache_write_price=cost_prices["cache_write"],
-                audio_input_tokens=summary["audio_input_tokens"],
-                audio_output_tokens=summary["audio_output_tokens"],
-                audio_input_price=cost_prices.get("audio_input", 0.0),
-                audio_output_price=cost_prices.get("audio_output", 0.0),
+                cache_read_price=prices["cache_read"],
+                cache_write_price=prices["cache_write"],
+                audio_input_tokens=int(token_dict.get("audio_input_tokens") or 0),
+                audio_output_tokens=int(token_dict.get("audio_output_tokens") or 0),
+                audio_input_price=prices.get("audio_input", 0.0),
+                audio_output_price=prices.get("audio_output", 0.0),
+                profit_multiplier=charge_multiplier,
+                usd_cny_rate=pricing_config.usd_cny_rate,
+                cost_usd_cny_rate=cost_rate,
             )
-            summary["cost_cny"] = actual_cost_usd * pricing_config.usd_cny_rate
-            summary["profit"] = summary["charged"] - summary["cost_cny"]
-            summary["billing_basis"] = "original"
-            summary["multiplier"] = 1.0
-        else:
-            summary["billing_basis"] = "cost"
-        summary["model"] = model
-        if is_embedding:
-            summary["kind"] = "embedding"
-        if is_gpt_audio:
-            summary["kind"] = "audio"
-        summary["service_tier"] = service_tier
-        summary["service_tier_multiplier"] = (
-            1.0 if use_teamo_prices and normalize_model_name(model) in TEAMO_FAST_MODEL_MONEY_DICT
-            and service_tier in {"fast", "priority"}
-            else SERVICE_TIER_MULTIPLIERS[service_tier]
-        )
-        summary["reasoning_effort"] = reasoning_effort
-        summary["long_context"] = long_context
-        summary["context_tier"] = context_tier
-        summary["audio_input_tokens"] = int(token_dict.get("audio_input_tokens") or 0)
-        summary["audio_output_tokens"] = int(token_dict.get("audio_output_tokens") or 0)
-        remain_before = user.token or 0
-        user.token = remain_before - summary["charged"]
-        summary["remain"] = user.token
-        user.input_token = (user.input_token or 0) + (
-            token_dict.get("input_tokens", 0) + cache_read_tokens + cache_write_tokens
-            + int(token_dict.get("audio_input_tokens") or 0)
-        )
-        user.output_token = (user.output_token or 0) + (
-            token_dict.get("output_tokens", 0) + int(token_dict.get("audio_output_tokens") or 0)
-        )
-        await apply_billed_usage(db, req_id, summary)
-        await db.commit()
-        if summary["remain"] <= 0:
-            invalidate_user_auth(user_id)
+            if flat_price:
+                # 成本/利润仍按上游成本价 × 汇率（与对用户扣费无关）
+                actual_cost_usd = calc_token_usd_cost(
+                    summary["input_tokens"],
+                    summary["output_tokens"],
+                    cost_prices["input"],
+                    cost_prices["output"],
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_read_price=cost_prices["cache_read"],
+                    cache_write_price=cost_prices["cache_write"],
+                    audio_input_tokens=summary["audio_input_tokens"],
+                    audio_output_tokens=summary["audio_output_tokens"],
+                    audio_input_price=cost_prices.get("audio_input", 0.0),
+                    audio_output_price=cost_prices.get("audio_output", 0.0),
+                )
+                summary["cost_cny"] = actual_cost_usd * (cost_rate or pricing_config.usd_cny_rate)
+                summary["profit"] = summary["charged"] - summary["cost_cny"]
+                summary["billing_basis"] = "user_price" if user_price else "original"
+                summary["multiplier"] = 1.0
+            else:
+                summary["billing_basis"] = "cost"
+            summary["model"] = model
+            if is_embedding:
+                summary["kind"] = "embedding"
+            if is_gpt_audio:
+                summary["kind"] = "audio"
+            summary["service_tier"] = service_tier
+            summary["service_tier_multiplier"] = (
+                1.0 if use_teamo_prices and normalize_model_name(model) in TEAMO_FAST_MODEL_MONEY_DICT
+                and service_tier in {"fast", "priority"}
+                else SERVICE_TIER_MULTIPLIERS[service_tier]
+            )
+            summary["reasoning_effort"] = reasoning_effort
+            summary["long_context"] = long_context
+            summary["context_tier"] = context_tier
+            summary["audio_input_tokens"] = int(token_dict.get("audio_input_tokens") or 0)
+            summary["audio_output_tokens"] = int(token_dict.get("audio_output_tokens") or 0)
+            remain_before = user.token or 0
+            user.token = remain_before - summary["charged"]
+            summary["remain"] = user.token
+            user.input_token = (user.input_token or 0) + (
+                token_dict.get("input_tokens", 0) + cache_read_tokens + cache_write_tokens
+                + int(token_dict.get("audio_input_tokens") or 0)
+            )
+            user.output_token = (user.output_token or 0) + (
+                token_dict.get("output_tokens", 0) + int(token_dict.get("audio_output_tokens") or 0)
+            )
+            await apply_billed_usage(db, req_id, summary)
+            await db.commit()
+            if summary["remain"] <= 0:
+                invalidate_user_auth(user_id)
+            # 日志放在写库任务内：客户端断开后调用方会抛取消，放在外面会跳过这行，
+            # 数据库已扣费但 billing.log 查不到记录。
+            _log_billed(req_id, user_id, source, model, context_tier, summary,
+                        charge_money_rate, charge_discount, started, first_byte_at)
+            return True
 
+    if not await finish_writes(write):
+        return None
+
+    return summary
+
+
+def _log_billed(req_id, user_id, source, model, context_tier, summary,
+                charge_money_rate, charge_discount, started, first_byte_at):
     ttfb_ms, done_ms = billing_timing(started, first_byte_at)
     billing_log.info(
-        "ok req=%s user=%s source=%s model=%s context=%s in=%s cache_read=%s cache_write=%s out=%s spent=%.6f profit=%.6f remain=%.6f usd=%.6f multiplier=%s cache_read_x=%s cache_write_x=%s fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
+        "ok req=%s user=%s source=%s model=%s context=%s in=%s cache_read=%s cache_write=%s out=%s spent=%.6f cost=%.6f profit=%.6f remain=%.6f usd=%.6f multiplier=%s cache_read_x=%s cache_write_x=%s fx=%s cost_fx=%s money_rate=%s discount=%s ttfb_ms=%s done_ms=%s",
         req_id,
         user_id,
         source,
@@ -723,6 +770,7 @@ async def compute_user_token(
         summary["cache_write_tokens"],
         summary["output_tokens"],
         summary["charged"],
+        summary.get("cost_cny") or 0.0,
         summary["profit"],
         summary["remain"],
         summary["usd_cost"],
@@ -730,9 +778,9 @@ async def compute_user_token(
         CACHE_READ_MULTIPLIER,
         CACHE_WRITE_MULTIPLIER,
         summary["usd_cny_rate"],
+        summary.get("cost_usd_cny_rate") or summary["usd_cny_rate"],
         charge_money_rate,
         charge_discount,
         ttfb_ms,
         done_ms,
     )
-    return summary

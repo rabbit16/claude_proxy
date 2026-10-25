@@ -23,6 +23,36 @@ def phone_credential_allowed(register_time, *, revoked: bool = False, has_issued
     return phone_key_allowed(register_time)
 
 
+def billing_key_for_user(user) -> str:
+    """鉴权后交给计费链路的用户键：手机号优先，匿名用户回落主键。
+
+    匿名注册用户 tb_user.telephone 为 NULL；若继续返回空串，后续按手机号
+    查用户的扣费写入会全部落空（user_missing）。主键字符串纯数字，
+    也能被价目/路由里的 _user_id_from_key 识别。
+    """
+    telephone = (getattr(user, "telephone", None) or "").strip()
+    if telephone:
+        return telephone
+    user_id = getattr(user, "user_id", None)
+    return str(user_id) if user_id else ""
+
+
+async def resolve_billing_user(db, user_key: str):
+    """按计费键反查用户：手机号优先，匿名用户回落到主键。"""
+    key = (user_key or "").strip()
+    if not key:
+        return None
+    if key.startswith("sk-"):
+        return await lookup_user_by_credential(db, key)
+    result = await db.execute(select(User).filter_by(telephone=key))
+    user = result.scalars().first()
+    if user is not None:
+        return user
+    if key.isdigit():
+        return await db.get(User, int(key))
+    return None
+
+
 async def lookup_user_by_credential(db, key: str):
     """用请求里的密钥找到未删除用户。
 

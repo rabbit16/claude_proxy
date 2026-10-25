@@ -67,6 +67,7 @@ def _row_dict(row: ModelRoute) -> dict:
         "id": row.id,
         "model": (row.model or "").strip().lower(),
         "vendor_code": (row.vendor_code or "").strip().lower(),
+        "group_name": (getattr(row, "group_name", None) or "").strip(),
         "api_key": (getattr(row, "api_key", None) or "").strip(),
         "api_key_id": getattr(row, "api_key_id", None),
         "user_ids": user_ids,
@@ -366,6 +367,23 @@ def overlay_catalog_rows(
     return out, summaries
 
 
+def normalize_route_models(models: Optional[list], fallback: str = "") -> list[str]:
+    """一组对外模型名 → 去重后的规范化模式。每项都要通过星号规则校验。"""
+    raw = list(models or [])
+    if not raw and fallback:
+        raw = [fallback]
+    out: list[str] = []
+    for item in raw:
+        pattern = normalize_route_pattern(str(item or ""))
+        if pattern not in out:
+            out.append(pattern)
+    if not out:
+        raise ValueError("model is required")
+    if len(out) > 200:
+        raise ValueError("一条规则最多 200 个模型")
+    return out
+
+
 async def upsert_route(
     *,
     model: str,
@@ -376,56 +394,87 @@ async def upsert_route(
     api_key: Optional[str] = None,
     api_key_id: Optional[int] = None,
     user_ids: Optional[list] = None,
+    group_name: Optional[str] = None,
+    models: Optional[list] = None,
 ) -> dict:
-    model = normalize_route_pattern(model)
+    """单条或分组批量写入。传 models 时把它们全部指向同一 vendor / Key / 用户名单。
+
+    分组名相同即视为同一组：改分组时先按「编辑时的旧分组」或 route_id 找旧成员，
+    再对齐到本次提交的模型集合，并把整组 vendor / Key / 用户名单同步过去。
+    """
+    patterns = normalize_route_models(models, fallback=model)
     vendor_code = (vendor_code or "").strip().lower()
     if not resolve_vendor(vendor=vendor_code):
         raise ValueError(f"unknown vendor: {vendor_code}")
     if api_key_id and not vendor_key_secret(vendor_code, api_key_id):
         raise ValueError(f"unknown vendor key: {api_key_id}")
+    group = (group_name or "").strip()[:128]
+    ids: list[int] = []
+    if user_ids is not None:
+        ids = normalize_user_ids(user_ids)
+        if len(ids) > 500:
+            raise ValueError("too many users on one route")
+        if ids:
+            found = set((await db.execute(
+                select(User.user_id).where(User.user_id.in_(ids))
+            )).scalars().all())
+            missing = [item for item in ids if item not in found]
+            if missing:
+                raise ValueError(f"unknown user: {missing[0]}")
+
     async with AsyncSessionLocal() as db:
-        row = None
-        if route_id:
-            row = await db.get(ModelRoute, route_id)
-        if row is None:
-            row = (await db.execute(select(ModelRoute).where(ModelRoute.model == model))).scalars().first()
-        if row is None:
-            row = ModelRoute(model=model)
-            db.add(row)
-        else:
-            clash = (await db.execute(
-                select(ModelRoute).where(ModelRoute.model == model, ModelRoute.id != row.id)
-            )).scalars().first()
-            if clash:
-                raise ValueError(f"model already routed: {model}")
-        row.model = model
-        row.vendor_code = vendor_code
-        row.is_active = bool(is_active)
-        row.note = (note or "")[:200]
-        if api_key is not None:
-            row.api_key = (api_key or "").strip() or None
-        if api_key_id is not None:
-            # 指定命名 Key 时清掉临时覆盖，避免两套密钥同时存在产生歧义
-            row.api_key_id = int(api_key_id) or None
-            if row.api_key_id:
-                row.api_key = None
-        if user_ids is not None:
-            ids = normalize_user_ids(user_ids)
-            if len(ids) > 500:
-                raise ValueError("too many users on one route")
-            if ids:
-                found = set((await db.execute(
-                    select(User.user_id).where(User.user_id.in_(ids))
-                )).scalars().all())
-                missing = [item for item in ids if item not in found]
-                if missing:
-                    raise ValueError(f"unknown user: {missing[0]}")
-            row.user_ids = ids
+        existing = list((await db.execute(select(ModelRoute))).scalars().all())
+        by_model = {row.model: row for row in existing}
+        target_row = next((row for row in existing if route_id and row.id == route_id), None)
+        # 分组改名：按编辑前那条记录的分组，把旧成员一起带过来
+        old_group = (getattr(target_row, "group_name", "") or "").strip() if target_row else ""
+
+        def members_of(name: str) -> list[ModelRoute]:
+            if not name:
+                return []
+            return [row for row in existing if (row.group_name or "").strip() == name]
+
+        old_members = members_of(old_group) if old_group else ([target_row] if target_row else [])
+
+        for pattern in patterns:
+            clash = by_model.get(pattern)
+            if clash is not None and clash not in old_members and clash.id != route_id:
+                raise ValueError(f"model already routed: {pattern}")
+
+        # 本组不再包含的旧成员：拆分出去的放开为独立规则，而不是直接删除
+        kept = set(patterns)
+        for row in old_members:
+            if row.model not in kept:
+                row.group_name = ""
+        if old_group and group and old_group != group:
+            for row in old_members:
+                row.group_name = group
+
+        saved_ids: list[int] = []
+        for pattern in patterns:
+            row = by_model.get(pattern)
+            if row is None:
+                row = ModelRoute(model=pattern)
+                db.add(row)
+            row.model = pattern
+            row.group_name = group
+            row.vendor_code = vendor_code
+            row.is_active = bool(is_active)
+            row.note = (note or "")[:200]
+            if api_key is not None:
+                row.api_key = (api_key or "").strip() or None
+            if api_key_id is not None:
+                # 指定命名 Key 时清掉临时覆盖，避免两套密钥同时存在产生歧义
+                row.api_key_id = int(api_key_id) or None
+                if row.api_key_id:
+                    row.api_key = None
+            if user_ids is not None:
+                row.user_ids = ids
+            await db.flush()
+            saved_ids.append(row.id)
         await db.commit()
-        await db.refresh(row)
-        saved_id = row.id
     await reload_routes()
-    saved = next((item for item in list_routes() if item["id"] == saved_id), None)
+    saved = next((item for item in list_routes() if item["id"] == saved_ids[0]), None)
     if saved is None:
         raise ValueError("route save failed")
     return saved

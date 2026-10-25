@@ -576,7 +576,11 @@ def strip_read_pages(body: bytes, parsed_body: dict) -> tuple:
 
 
 def strip_openai_prefix_from_request(body: bytes, parsed_body: dict) -> tuple:
-    """请求里若仍带着 openai/，剥掉后再转发。"""
+    """请求里若仍带着 openai/，剥掉后再转发。
+
+    只改 parsed_body，body 由调用方在最后统一序列化一次；带图请求有几 MB 的
+    base64，中间每改一步就重 dump 一次纯属白搬。
+    """
     if not isinstance(parsed_body, dict):
         return body, parsed_body
     model = parsed_body.get("model")
@@ -587,7 +591,7 @@ def strip_openai_prefix_from_request(body: bytes, parsed_body: dict) -> tuple:
         return body, parsed_body
     updated = dict(parsed_body)
     updated["model"] = stripped
-    return _replace_json_request_body(body, updated)
+    return body, updated
 
 
 # 号商 chat/completions 对部分 OpenAI 新字段不兼容（实测）。
@@ -870,10 +874,12 @@ def apply_upstream_model_to_request(
     *,
     teamo: Optional[bool] = None,
     yunxin: Optional[bool] = None,
+    serialize: bool = True,
 ) -> tuple:
     """号商模式把 body.model 换成 -hc 名；本地 LiteLLM 模式不覆盖。
 
     parsed_body 始终保留客户端标准名，供计费/日志。
+    serialize=False 时只返回改过 model 的 dict 和原 body，由调用方最后统一写盘。
     """
     if not isinstance(parsed_body, dict):
         return body, parsed_body
@@ -892,6 +898,8 @@ def apply_upstream_model_to_request(
         return body, parsed_body
     wire = dict(parsed_body)
     wire["model"] = upstream
+    if not serialize:
+        return body, wire
     new_body, _ = _replace_json_request_body(body, wire)
     return new_body, parsed_body
 
