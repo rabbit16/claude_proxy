@@ -80,6 +80,7 @@ from utils.common_utils import (
     map_model_to_upstream,
     ensure_chat_tools_reasoning_none,
     ensure_sse_event_name,
+    normalize_anthropic_thinking_for_upstream,
     normalize_max_tokens_for_upstream,
     normalize_upstream_path,
     parse_request_payload,
@@ -1275,6 +1276,23 @@ async def log_and_forward_requests(request: Request, call_next):
         path=request.url.path,
         session_key=extract_session_key(parsed_body),
     )
+    # Claude 5.x 强制 adaptive thinking。直通 Anthropic 协议时客户端老参数
+    # （thinking.type=disabled / enabled+budget_tokens）会被上游 400，这里就地规范化。
+    # 桥接路径 body 已被转换，且只在 Anthropic 上游协议下适用，故一并排除。
+    if (
+        source == "anthropic"
+        and not count_tokens_route
+        and not anthropic_bridge
+        and not responses_bridge
+        and not protocol_adapt
+        and upstream_path.rstrip("/") == "/v1/messages"
+    ):
+        normalized_body, normalized_parsed = normalize_anthropic_thinking_for_upstream(
+            body, parsed_body, model=upstream_model if upstream_model != "-" else ""
+        )
+        if normalized_parsed is not parsed_body:
+            body, parsed_body = normalized_body, normalized_parsed
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
     target_url = f"{request_base}{upstream_path}"
     # Anthropic/Responses 桥接后不要把原 query 原样带给目标端点
     if request.url.query and not anthropic_bridge and not responses_bridge and not protocol_adapt:

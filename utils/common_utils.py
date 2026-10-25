@@ -266,6 +266,76 @@ def ensure_chat_tools_reasoning_none(body: bytes, parsed_body: dict) -> tuple:
     return _replace_json_request_body(body, updated)
 
 
+def is_claude_adaptive_thinking_model(model: str) -> bool:
+    """Claude 5.x 起上游要求 adaptive thinking，旧的 disabled/enabled 一律 400。
+
+    只认 claude-*-5-5 / claude-*-5.5 及以后的 5.x 段位；4.x 及更早仍是旧语义，
+    必须保持原样，否则会把本来能用的请求改坏。
+    """
+    model = strip_openai_model_prefix(model).lower()
+    if not model.startswith("claude-"):
+        return False
+    # 取模型名里第一个「版本段」数字；4-5 / 4.5 是 4.x（旧语义），5-5 才是新规则。
+    # 只从第一个数字开始判断，避免把 claude-sonnet-4-5 里的 5 当成主版本。
+    match = re.search(r"(?<![a-z0-9])(\d+)(?:[-.]\d+)?", model)
+    if not match:
+        return False
+    try:
+        major = int(match.group(1))
+    except (TypeError, ValueError):
+        return False
+    return major >= 5
+
+
+def _claude_thinking_mode(model: str) -> str:
+    """返回该模型支持的最宽 thinking 模式：adaptive / between_tools。"""
+    model = strip_openai_model_prefix(model).lower()
+    if "sonnet" in model:
+        return "between_tools"
+    return "adaptive"
+
+
+def normalize_anthropic_thinking_for_upstream(
+    body: bytes, parsed_body: dict, *, model: str = ""
+) -> tuple:
+    """把老式 thinking 参数规范成上游 Claude 5.x 要求的形态。
+
+    上游对 claude-*-5-5 只接受 thinking.type=adaptive（sonnet 还接受
+    between_tools）+ output_config.effort，以下写法都会 400：
+      - thinking.type=disabled
+      - thinking.type=enabled / budget_tokens
+
+    直通（bridge=0）路径不做协议转换，客户端发什么就发什么，所以必须在这里拦。
+    """
+    if not isinstance(parsed_body, dict) or parsed_body.get("messages") is None:
+        return body, parsed_body
+    target = model or parsed_body.get("model") or ""
+    if not is_claude_adaptive_thinking_model(target):
+        return body, parsed_body
+    thinking = parsed_body.get("thinking")
+    if not isinstance(thinking, dict):
+        return body, parsed_body
+    thinking_type = str(thinking.get("type") or "").strip().lower()
+    if thinking_type in {"adaptive", "between_tools"}:
+        return body, parsed_body
+    updated = dict(parsed_body)
+    if thinking_type == "disabled" or not thinking_type:
+        # 旧 clients 用 disabled 显式关思考；新模型没有关闭开关，直接省略该字段。
+        updated.pop("thinking", None)
+    else:
+        mode = _claude_thinking_mode(target)
+        effort = str(thinking.get("effort") or "").strip().lower()
+        if effort not in {"low", "medium", "high", "max"}:
+            budget = thinking.get("budget_tokens")
+            effort = "high" if isinstance(budget, int) and budget >= 16000 else "medium"
+        updated["thinking"] = {"type": mode}
+        output_config = updated.get("output_config")
+        output_config = dict(output_config) if isinstance(output_config, dict) else {}
+        output_config.setdefault("effort", effort)
+        updated["output_config"] = output_config
+    return _replace_json_request_body(body, updated)
+
+
 def to_client_model_id(model: str) -> str:
     """号商模式下把 -hc 后缀对外还原成标准名；本地 LiteLLM 模式只剥 provider 前缀。"""
     model = strip_openai_model_prefix(model)
