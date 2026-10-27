@@ -225,8 +225,11 @@ MODEL_MAP_MONEY_DICT = {
     # GPT-6 / 5.6 / 5.5 / 5.4 的长上下文见 LONG_CONTEXT_RULES（prompt > 272K）
     "gpt-6-astra": _p(10.00, 50.00, 1.00, 12.50),
     "gpt-6-sol": _p(2.00, 10.00, 0.20, 2.50),
-    # https://developers.openai.com/api/docs/models/gpt-6.1-sol  缓存读为输入的 5%
+    # GPT-6.1 官方缓存读均为输入的 5%
+    # https://developers.openai.com/api/docs/models/gpt-6.1-sol
     "gpt-6.1-sol": _p(2.00, 10.00, 0.10, 2.50),
+    # https://developers.openai.com/api/docs/models/gpt-6.1-terra
+    "gpt-6.1-terra": _p(1.00, 5.00, 0.05, 1.25),
     "gpt-6-luna": _p(0.10, 0.50, 0.01, 0.125),
     "gpt-6": _p(10.00, 50.00, 1.00, 12.50),  # 默认对齐 Astra
 
