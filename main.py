@@ -18,7 +18,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 from settings.capacity import CAPACITY
 from settings.macro import (
-    CLAUDE_GPT_KEY, DOR2CHY, LEGACY_UPSTREAM_BASE, PROFIT_MULTIPLIER, TEAMO_HTTP_PROXY, TEAMO_UPSTREAM, UPSTREAM_BASE, VENDOR_UPSTREAM,
+    CLAUDE_GPT_KEY, DOR2CHY, LEGACY_UPSTREAM_BASE, PROFIT_MULTIPLIER, TEAMO_HTTP_PROXY,
+    TEAMO_UPSTREAM, UPSTREAM_BASE, VENDOR_HTTP_PROXY, VENDOR_UPSTREAM,
 )
 from utils.agent_task import (
     bind_agent_task,
@@ -59,6 +60,11 @@ from utils.common_utils import (
     extract_embedding_usage,
     extract_gemini_model_from_path,
     replace_gemini_model_in_path,
+    gemini_error_payload,
+    gemini_upstream_query,
+    is_gemini_stream_path,
+    parse_gemini_stream_payloads,
+    wants_gemini_sse,
     format_access_usage,
     is_audio_path,
     extract_usage,
@@ -109,6 +115,9 @@ from settings.models import (
     PricingSettings,
     PromptInjection,
     RequestUsage,
+    SoftRoute,
+    SoftRouteEpoch,
+    SoftRouteState,
     User,
     UpstreamVendor,
     UpstreamVendorKey,
@@ -145,6 +154,7 @@ from utils.vendor_catalog import (
     upsert_vendor_prices,
     vendor_api_key,
     vendor_profit_multiplier,
+    vendor_protocol_key_secret,
     vendor_resolved_api_key,
     PRICING_MODE_CATALOG_RATE,
 )
@@ -157,7 +167,23 @@ from utils.model_route import (
     reload_routes,
     replace_route_api_keys,
     resolve_runtime_for_model,
+    route_user_id_from_key,
+    rule_applies_to_user,
     upsert_route,
+)
+from utils.soft_route import (
+    active_states as list_active_soft_routes,
+    claim_run_epoch as claim_soft_route_epoch,
+    clear_active_states,
+    delete_soft_route,
+    list_soft_routes,
+    note_failure_status as note_upstream_failure,
+    note_success as note_upstream_success,
+    reload_soft_routes,
+    release_run_epoch as release_soft_route_epoch,
+    reset_states as reset_soft_route_states,
+    soft_route_supervisor,
+    upsert_soft_route,
 )
 from utils.user_price import (
     apply_user_price_to_catalog,
@@ -181,6 +207,7 @@ from utils.model_alias import (
     delete_alias,
     list_aliases,
     reload_aliases,
+    resolved_protocol,
     upsert_alias,
 )
 from utils.model_protocol import (
@@ -245,6 +272,9 @@ UPSTREAM_READ_TIMEOUT = 300.0
 UPSTREAM_WRITE_TIMEOUT = float(os.environ.get("UPSTREAM_WRITE_TIMEOUT") or 300.0)
 UPSTREAM_POOL_TIMEOUT = 15.0
 UPSTREAM_CLOSE_TIMEOUT = 5.0
+# 客户端断开后，后台补读上游只为拿 usage。断连风暴时上游可能迟迟不结束，
+# 必须封顶，否则这些「已无客户端」的请求会一直占着连接池。
+UPSTREAM_DRAIN_TIMEOUT = float(os.environ.get("UPSTREAM_DRAIN_TIMEOUT") or 60.0)
 # 超过该体积的请求体，写超时后不再重试：重传等于把同样的数据再搬一遍，
 # 只会继续占满上行、把客户端多挂几分钟。
 UPSTREAM_LARGE_BODY_BYTES = 4 * 1024 * 1024
@@ -300,6 +330,7 @@ async def release_upstream_stream(stream_cm, resp, *, timeout: float = UPSTREAM_
     close_task = asyncio.create_task(_close())
     _UPSTREAM_CLOSERS.add(close_task)
     close_task.add_done_callback(_UPSTREAM_CLOSERS.discard)
+    force_closed = False
     try:
         await asyncio.wait_for(asyncio.shield(close_task), timeout)
         return
@@ -307,18 +338,26 @@ async def release_upstream_stream(stream_cm, resp, *, timeout: float = UPSTREAM_
         # 关闭任务已脱离当前取消域继续执行；取消继续向上传播。
         raise
     except Exception:
-        network = None
-        if resp is not None:
-            network = (getattr(resp, "extensions", None) or {}).get("network_stream")
-        closer = getattr(network, "aclose", None) or getattr(network, "close", None)
-        if closer is None:
-            return
-        try:
-            result = closer()
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception:
-            process_log.warning("force close upstream socket failed", exc_info=True)
+        # 超时：close_task 仍是独立任务，wait_for 取消的只是 shield 外壳，
+        # 不主动取消的话它会一直挂着，连接永远回不到池里（池满即全量 PoolTimeout）。
+        force_closed = True
+    finally:
+        if force_closed:
+            if not close_task.done():
+                close_task.cancel()
+                await asyncio.gather(close_task, return_exceptions=True)
+            network = None
+            if resp is not None:
+                network = (getattr(resp, "extensions", None) or {}).get("network_stream")
+            closer = getattr(network, "aclose", None) or getattr(network, "close", None)
+            if closer is not None:
+                try:
+                    result = closer()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    process_log.warning("force close upstream socket failed", exc_info=True)
+            process_log.warning("upstream stream close timed out, forced socket close")
 
 
 async def _request_upstream_with_retry(
@@ -414,6 +453,16 @@ async def lifespan(app: FastAPI):
             ))
         else:
             app.state.http_teamo = client
+        # 普通号商的代理客户端：teamo 能直连时也能只给个别号商挂代理
+        if VENDOR_HTTP_PROXY:
+            app.state.http_proxy_vendor = (
+                app.state.http_teamo if VENDOR_HTTP_PROXY == TEAMO_HTTP_PROXY
+                else await stack.enter_async_context(httpx.AsyncClient(
+                    timeout=timeout, limits=limits, trust_env=False, proxy=VENDOR_HTTP_PROXY,
+                ))
+            )
+        else:
+            app.state.http_proxy_vendor = client
         app.state.upstream_sema = asyncio.Semaphore(UPSTREAM_CONCURRENCY)
         app.state.bg_billing_tasks = set()
         async with async_engine.begin() as conn:
@@ -430,6 +479,9 @@ async def lifespan(app: FastAPI):
                 await conn.run_sync(VendorModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(UserApiKey.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRoute.__table__.create, checkfirst=True)
+                await conn.run_sync(SoftRoute.__table__.create, checkfirst=True)
+                await conn.run_sync(SoftRouteEpoch.__table__.create, checkfirst=True)
+                await conn.run_sync(SoftRouteState.__table__.create, checkfirst=True)
                 await conn.run_sync(UserModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelProtocol.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelAlias.__table__.create, checkfirst=True)
@@ -453,9 +505,14 @@ async def lifespan(app: FastAPI):
         await reload_aliases()
         await reload_rewrites()
         await reload_injections()
+        # 软路由规则持久化；整个服务重启时换新世代，临时路由自动消失。
+        await reload_soft_routes()
+        if await claim_soft_route_epoch():
+            await reset_soft_route_states()
         await refresh_vendor_prices(force=True)
         pricing_task = asyncio.create_task(pricing_supervisor(pricing_stop))
         unbilled_task = asyncio.create_task(unbilled_supervisor(pricing_stop))
+        soft_route_task = asyncio.create_task(soft_route_supervisor(pricing_stop))
         await asyncio.to_thread(warmup_headroom)
         runtime = get_runtime_upstream()
         process_log.info(
@@ -476,10 +533,11 @@ async def lifespan(app: FastAPI):
         yield
         process_log.info("proxy stopping")
         pricing_stop.set()
+        await release_soft_route_epoch()
         pending_billing = list(getattr(app.state, "bg_billing_tasks", set()) or [])
         if pending_billing:
             await asyncio.gather(*pending_billing, return_exceptions=True)
-        background_tasks = [task for task in (pricing_task, unbilled_task) if task]
+        background_tasks = [task for task in (pricing_task, unbilled_task, soft_route_task) if task]
         for task in background_tasks:
             task.cancel()
         if background_tasks:
@@ -516,6 +574,23 @@ def _header_value(headers: dict, name: str) -> str:
     return ""
 
 
+def _html_error_message(html_text: str, status_code: int) -> str:
+    """把上游 HTML 拦截页（区域封锁/网关页）压成一行可读消息，别把整页塞给客户端。"""
+    import re
+
+    raw = html_text or ""
+    for pattern in (r"<title[^>]*>(.*?)</title>", r"<h1[^>]*>(.*?)</h1>"):
+        found = re.search(pattern, raw, re.S | re.I)
+        if found:
+            text = re.sub(r"<[^>]+>", " ", found.group(1))
+            text = " ".join(text.split())
+            if text:
+                return f"upstream returned html page ({status_code}): {text[:200]}"
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", raw, flags=re.S | re.I)
+    text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+    return f"upstream returned html page ({status_code}): {text[:200] or 'no text'}"
+
+
 def _extract_upstream_error_message(err_text: str, status_code: int) -> str:
     try:
         err_obj = json.loads(err_text or "{}")
@@ -545,6 +620,14 @@ def _stream_error_chunks(source: str, message: str, status_code: int = 502):
         yield (
             "event: error\ndata: "
             + json.dumps(payload, ensure_ascii=False)
+            + "\n\n"
+        ).encode("utf-8")
+        return
+    if source == "gemini":
+        # Gemini 原生协议没有 [DONE]，错误按 Google 形状吐一条即可。
+        yield (
+            "data: "
+            + json.dumps(gemini_error_payload(msg, "", status_code), ensure_ascii=False)
             + "\n\n"
         ).encode("utf-8")
         return
@@ -644,6 +727,30 @@ _FAKE_NON_STREAM_VENDORS = {
 
 def needs_fake_non_stream(vendor: str) -> bool:
     return (vendor or "").strip().lower() in _FAKE_NON_STREAM_VENDORS
+
+
+def responses_events_to_response(events: list[dict]) -> tuple[Optional[dict], str]:
+    """把 Responses SSE 事件还原成非流式 response 对象。
+
+    只有终止事件才带完整 response；流不完整时返回 (None, "")，由调用方按失败
+    处理，避免把半截结果伪装成正常应答。第二个返回值是 response.failed 的错误
+    信息，非空表示上游本次生成失败。
+    """
+    for event in reversed(events or []):
+        if not isinstance(event, dict):
+            continue
+        typ = event.get("type")
+        if typ not in {"response.completed", "response.incomplete", "response.failed"}:
+            continue
+        response = event.get("response") if isinstance(event.get("response"), dict) else None
+        if typ == "response.failed":
+            err = (response or {}).get("error") or event.get("error") or {}
+            message = ""
+            if isinstance(err, dict):
+                message = str(err.get("message") or err.get("code") or err.get("type") or "")
+            return response, message or "upstream response failed"
+        return response, ""
+    return None, ""
 
 
 def non_stream_chunk_to_completion(
@@ -808,7 +915,7 @@ def _auth_error_response(source: str, reason: str, want_stream: bool):
     payload = build_error_payload(source, message, reason)
     if want_stream:
         return StreamingResponse(
-            common_message_yield(message, source=source),
+            common_message_yield(message, source=source, reason=reason),
             status_code=status,
             media_type="text/event-stream",
         )
@@ -1020,8 +1127,16 @@ async def log_and_forward_requests(request: Request, call_next):
     source = detect_source(request.url.path, headers)
     model = parsed_body.get("model") or "-"
     client_model = (alias_rule or {}).get("alias") or model
-    want_stream = bool(parsed_body.get("stream")) or "text/event-stream" in (
-        headers.get("accept") or ""
+    gemini_native_route = is_gemini_native_path(request.url.path)
+    gemini_stream_route = is_gemini_stream_path(request.url.path)
+    # Gemini 原生流式的开关在路径和 query 上，body 里没有 stream 字段。
+    gemini_sse = gemini_stream_route and wants_gemini_sse(
+        request.url.query, headers.get("accept") or ""
+    )
+    want_stream = (
+        bool(parsed_body.get("stream"))
+        or "text/event-stream" in (headers.get("accept") or "")
+        or gemini_sse
     )
     # 计数接口固定非流式，避免客户端 Accept 把头带成 SSE 后把 JSON 当流处理。
     count_tokens_route = is_count_tokens_path(request.url.path)
@@ -1072,7 +1187,7 @@ async def log_and_forward_requests(request: Request, call_next):
                 await finish_request_usage(req_id, 403)
                 if want_stream:
                     return StreamingResponse(
-                        common_message_yield(message, source=source),
+                        common_message_yield(message, source=source, reason="phone_model_blocked"),
                         status_code=403,
                         media_type="text/event-stream",
                     )
@@ -1104,6 +1219,10 @@ async def log_and_forward_requests(request: Request, call_next):
             await finish_request_usage(req_id, status)
             return _auth_error_response(source, user_id or "not exist", want_stream)
 
+        if gemini_native_route:
+            # 客户端的 Google 凭据不能带到团队上游，鉴权统一用上游 key。
+            headers = {k: v for k, v in headers.items() if k.lower() != "x-goog-api-key"}
+
         if model and model != "-":
             body, parsed_body, rewrite_rule = apply_model_rewrite(
                 body, parsed_body, user_key=str(user_id or ""),
@@ -1120,6 +1239,23 @@ async def log_and_forward_requests(request: Request, call_next):
                 model = rewritten
                 await retarget_request_usage(req_id, model)
 
+        if is_models_path(request.url.path):
+            # 模型列表由本地价目表 + 路由 + 别名汇总，不再依赖上游 /v1/models。
+            payload = _local_models_for_user(str(user_id or ""))
+            await finish_request_usage(req_id, 200)
+            _log_access(
+                request,
+                req_id=req_id,
+                user_id=user_id or "-",
+                source=source,
+                model=model,
+                stream=False,
+                status=200,
+                started=started,
+                extra=f"result=local_models count={len(payload['data'])}",
+            )
+            return JSONResponse(status_code=200, content=payload)
+
     audio_route = is_audio_path(request.url.path)
     audio_model = _is_gpt_audio_model(model)
     # GPT-Audio 始终走原有 LiteLLM（4001）和本地标准价目表，不受上游模式影响。
@@ -1127,7 +1263,7 @@ async def log_and_forward_requests(request: Request, call_next):
     runtime = (
         get_runtime_upstream(vendor="legacy")
         if legacy_audio_request
-        else resolve_runtime_for_model(model, user_key=user_id)
+        else resolve_runtime_for_model(model, user_key=user_id, protocol=source)
     )
     runtime_teamo = bool(runtime.get("teamo"))
     runtime_yunxin = bool(runtime.get("yunxin"))
@@ -1184,7 +1320,7 @@ async def log_and_forward_requests(request: Request, call_next):
             await finish_request_usage(req_id, 400)
             return JSONResponse(status_code=400, content={"error": {"message": "Only gpt-audio models are enabled for audio endpoints"}})
     if not legacy_audio_request:
-        runtime = resolve_runtime_for_model(model, user_key=user_id)
+        runtime = resolve_runtime_for_model(model, user_key=user_id, protocol=source)
         runtime_teamo = bool(runtime.get("teamo"))
         runtime_yunxin = bool(runtime.get("yunxin"))
         runtime_vendor = (runtime.get("code") or "").strip().lower()
@@ -1342,9 +1478,13 @@ async def log_and_forward_requests(request: Request, call_next):
     if count_tokens_route:
         headers = apply_upstream_auth(headers, api_key=count_key, teamo=True)
     else:
+        # 协议专用 Key 优先于业商默认 Key，未绑定协议的号商行为不变
+        protocol_key = vendor_protocol_key_secret(runtime.get("code") or "", source)
         headers = apply_upstream_auth(
             headers,
-            api_key=(runtime.get("route_api_key") or "").strip() or vendor_resolved_api_key(runtime.get("code") or ""),
+            api_key=(runtime.get("route_api_key") or "").strip()
+            or protocol_key
+            or vendor_resolved_api_key(runtime.get("code") or ""),
             teamo=bool(runtime.get("teamo")),
         )
     # DeepSeek 会按客户端声明的 Accept-Encoding 返回 br/zstd；服务端 httpx 缺少对应
@@ -1371,6 +1511,11 @@ async def log_and_forward_requests(request: Request, call_next):
             compression_extra += f" from_vendor={routed_from}"
     else:
         compression_extra = (compression_extra + f" vendor={runtime['code']}").strip()
+        if runtime.get("soft_routed"):
+            compression_extra = (
+                compression_extra
+                + f" soft_route={runtime.get('soft_from_vendor') or '-'}->{runtime['code']}"
+            ).strip()
         if runtime.get("routed"):
             compression_extra = (compression_extra + f" route={runtime.get('route_model')}").strip()
         if (runtime.get("route_api_key") or "").strip():
@@ -1435,7 +1580,12 @@ async def log_and_forward_requests(request: Request, call_next):
             headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
     target_url = f"{request_base}{upstream_path}"
     # Anthropic/Responses 桥接后不要把原 query 原样带给目标端点
-    if request.url.query and not anthropic_bridge and not responses_bridge and not protocol_adapt:
+    if gemini_native_route:
+        # Gemini 的流式开关在 query 上；客户端 key 一律丢弃，只保留其余参数。
+        query = gemini_upstream_query(request.url.query, force_sse=gemini_sse)
+        if query:
+            target_url += f"?{query}"
+    elif request.url.query and not anthropic_bridge and not responses_bridge and not protocol_adapt:
         target_url += f"?{request.url.query}"
     # 部分供应商的 chat/completions 只出 SSE：非流式请求改按流式取数，下面聚合后
     # 再以普通 JSON 返回。只处理原生 chat 协议，桥接路径各自已有完整转换。
@@ -1463,6 +1613,28 @@ async def log_and_forward_requests(request: Request, call_next):
         pending_body_rewrite = True
         headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
         process_log.info("fake non-stream req=%s vendor=%s model=%s", req_id, runtime_vendor, model)
+    elif (
+        not want_stream
+        and not count_tokens_route
+        and not anthropic_bridge
+        and not responses_bridge
+        and not protocol_adapt
+        and source == "responses"
+        and needs_fake_non_stream(runtime_vendor)
+        and upstream_path.rstrip("/").endswith("/responses")
+    ):
+        # 同款伪装流式，但对象是 /v1/responses：部分供应商（如 tongtong 的
+        # svip 分组）会直接拒绝 stream=false。这里改发 stream=true，读完终止事件
+        # 再取其中的完整 response 原样返回，客户端仍按非流式 JSON 处理。
+        parsed_body = dict(parsed_body)
+        parsed_body["stream"] = True
+        fake_non_stream = True
+        pending_body_rewrite = True
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+        process_log.info(
+            "fake non-stream req=%s vendor=%s model=%s source=responses",
+            req_id, runtime_vendor, model,
+        )
     if pending_body_rewrite:
         # 所有改写（别名、模型名、清洗字段）已合并到 parsed_body，这里统一写一次。
         # 未带 Content-Length 的原样保留客户端字节，缓存前缀不受影响。
@@ -1482,12 +1654,40 @@ async def log_and_forward_requests(request: Request, call_next):
         summarize_request_keys(parsed_body),
     )
 
-    client: httpx.AsyncClient = (
-        request.app.state.http_teamo if (runtime_teamo or count_tokens_route) else request.app.state.http
-    )
+    # teamo 走 TEAMO_HTTP_PROXY；其它号商按后台 use_proxy 勾选走 VENDOR_HTTP_PROXY
+    # （未配置 VENDOR_HTTP_PROXY 时回落到 TEAMO_HTTP_PROXY，行为与之前一致）。
+    if runtime_teamo or count_tokens_route:
+        client: httpx.AsyncClient = request.app.state.http_teamo
+    elif runtime.get("use_proxy"):
+        client = getattr(request.app.state, "http_proxy_vendor", None) or request.app.state.http
+    else:
+        client = request.app.state.http
     # 伪非流式聚合结果，非流式分支和日志都要用，放在请求级作用域。
     fake_chunks: list[dict] = []
     fake_raw = b""
+    fake_error_message = ""
+
+    async def _note_soft_route_error(status_code: int):
+        """上游失败计入软路由连续失败计数。按真正承接本次请求的号商归类。
+
+        已经被软路由切走的请求不再计数：否则会对备用号商的失败重复累计，
+        在备用号商也出问题时触发一条毫无意义的「再切到同一个号商」。
+        """
+        if legacy_audio_request or count_tokens_route or runtime.get("soft_routed"):
+            return
+        try:
+            await note_upstream_failure(model, runtime_vendor, status_code)
+        except Exception:
+            process_log.exception("soft route note failure failed req=%s", req_id)
+
+    async def _note_soft_route_ok():
+        if legacy_audio_request or count_tokens_route or runtime.get("soft_routed"):
+            return
+        try:
+            await note_upstream_success(model, runtime_vendor)
+        except Exception:
+            process_log.exception("soft route note success failed req=%s", req_id)
+
     async def stream_response():
         collector = StreamUsageCollector()
         billed = False
@@ -1627,12 +1827,26 @@ async def log_and_forward_requests(request: Request, call_next):
         async def drain_upstream_for_billing(
             resp, leftover: bytes = b"", *, terminal_forwarded: bool = False, vendor_prices_only: bool = False,
         ):
-            """页面已停，后台继续读上游到结束，再按 usage 扣费。断连时只用当前供应商价目。"""
+            """页面已停，后台继续读上游到结束，再按 usage 扣费。断连时只用当前供应商价目。
+
+            断连风暴时上游可能很慢；这里封顶 UPSTREAM_DRAIN_TIMEOUT，
+            到点直接放弃剩余内容，把连接交还给 close 路径，避免把连接池占死。
+            """
             nonlocal sse_buf, upstream_bytes
             sse_buf = leftover or b""
             try:
                 if not terminal_forwarded:
+                    deadline = time.monotonic() + UPSTREAM_DRAIN_TIMEOUT
+                    timed_out = False
                     async for chunk in _iter_upstream_with_heartbeat(resp):
+                        if time.monotonic() > deadline:
+                            timed_out = True
+                            process_log.warning(
+                                "drain upstream for billing deadline reached req=%s bytes=%s",
+                                req_id,
+                                upstream_bytes,
+                            )
+                            break
                         if chunk is None:
                             continue
                         upstream_bytes += len(chunk or b"")
@@ -1653,6 +1867,9 @@ async def log_and_forward_requests(request: Request, call_next):
                                 break
                         if terminal_forwarded:
                             break
+                    if timed_out:
+                        # 剩余流不再消费，交给调用方的 release/force close 关闭传输。
+                        return
                 if sse_buf.strip():
                     try:
                         leftover_text = sse_buf.decode("utf-8")
@@ -1738,6 +1955,10 @@ async def log_and_forward_requests(request: Request, call_next):
 
         async def _iter_upstream_with_heartbeat(resp):
             """读取上游 SSE；空闲时发注释心跳，避免中间层误判连接超时。"""
+            if getattr(resp, "is_stream_consumed", False):
+                # 下游已读过这个流：后台补读只会抛 StreamConsumed，直接结束，
+                # 让调用方走 close/释放路径，不再二次消费。
+                return
             iterator = resp.aiter_bytes().__aiter__()
             pending = None
             try:
@@ -1891,8 +2112,12 @@ async def log_and_forward_requests(request: Request, call_next):
                     stream_released = False
 
                     async def release_once():
+                        # 只去重，不看 billing_handed_off。记账交接是后台 drain 在读同一个
+                        # resp；这里的关闭是幂等的（__aexit__ 对已关闭的流无副作用），
+                        # 放行后 socket 立刻归还池。早先按 billing_handed_off 提前 return，
+                        # 导致正常完成的流从不关闭，连接池被 CLOSE-WAIT 占满后全量 PoolTimeout。
                         nonlocal stream_released
-                        if stream_released or billing_handed_off:
+                        if stream_released:
                             return
                         stream_released = True
                         await release_upstream_stream(stream_cm, resp)
@@ -1960,30 +2185,92 @@ async def log_and_forward_requests(request: Request, call_next):
                                         client_events += 1
                                         mark_first_sse()
                                         yield chunk
+                                    await _note_soft_route_error(resp.status_code)
                                     access_stream(status=resp.status_code, extra="result=upstream_error")
                                     return
 
-                                # 声明 stream 却回 JSON：常见于供应商不支持 beta/1m 时直接落错误体
+                                # 声明 stream 却回 JSON：常见于供应商不支持 beta/1m 时直接落错误体。
+                                # Gemini 原生 :streamGenerateContent 默认就回 JSON 数组（带
+                                # alt=sse 才回 SSE），先按多分片解析，解析不出来才当错误处理。
                                 if "text/event-stream" not in content_type and "json" in content_type:
                                     raw = await resp.aread()
                                     upstream_bytes = len(raw or b"")
-                                    err_text = (raw or b"").decode(errors="ignore")
-                                    err_msg = _extract_upstream_error_message(err_text, resp.status_code)
-                                    process_log.warning(
-                                        "upstream non-sse body on stream req=%s status=%s body=%s",
-                                        req_id,
-                                        resp.status_code,
-                                        err_text[:800].replace("\n", " "),
+                                    gemini_payloads = (
+                                        parse_gemini_stream_payloads(raw)
+                                        if gemini_native_route and resp.status_code < 400
+                                        else []
                                     )
-                                    if attempt < UPSTREAM_RETRY_ATTEMPTS:
-                                        retry_stream = True
+                                    if gemini_payloads:
+                                        for item in gemini_payloads:
+                                            text = (
+                                                "data: "
+                                                + json.dumps(item, ensure_ascii=False)
+                                                + "\n\n"
+                                            )
+                                            obj, usage = handle_event(text)
+                                            async for out in emit_downstream(text, obj, usage):
+                                                yield out
+                                        saw_terminator = True
+                                        # 这条分支不经过下面的 SSE 读取段，计费要在这里补齐。
+                                        if not billed:
+                                            leftover_usage = collector.flush() or collector.usage
+                                            if leftover_usage or (runtime_teamo and collector.request_id):
+                                                await charge_once(leftover_usage or {})
+                                            elif is_billable_path(request.url.path):
+                                                process_log.warning(
+                                                    "no usage in stream req=%s user=%s", req_id, user_id,
+                                                )
+                                        if billing:
+                                            billing["next_block_index"] = max(
+                                                collector.max_block_index + 1, 1
+                                            )
+                                        process_log.info(
+                                            "stream json-forwarded req=%s status=%s bytes=%s pieces=%s",
+                                            req_id,
+                                            resp.status_code,
+                                            upstream_bytes,
+                                            len(gemini_payloads),
+                                        )
+                                        break
                                     else:
+                                        err_text = (raw or b"").decode(errors="ignore")
+                                        err_msg = _extract_upstream_error_message(err_text, resp.status_code)
+                                        process_log.warning(
+                                            "upstream non-sse body on stream req=%s status=%s body=%s",
+                                            req_id,
+                                            resp.status_code,
+                                            err_text[:800].replace("\n", " "),
+                                        )
+                                        if attempt < UPSTREAM_RETRY_ATTEMPTS:
+                                            retry_stream = True
+                                        else:
+                                            for chunk in _stream_error_chunks(source, err_msg, resp.status_code or 502):
+                                                mark_first_sse()
+                                                yield chunk
+                                            await _note_soft_route_error(resp.status_code or 502)
+                                            access_stream(status=resp.status_code or 502, extra="result=upstream_non_sse")
+                                            return
+                                else:
+                                    # 上游 200 回 HTML 页面（区域封锁/网关拦截页）既不是 SSE
+                                    # 也不是 JSON，直接喂给 SSE 解析器只会得到半截流。
+                                    if "text/html" in content_type:
+                                        raw = await resp.aread()
+                                        upstream_bytes = len(raw or b"")
+                                        err_text = (raw or b"").decode(errors="ignore")
+                                        process_log.warning(
+                                            "upstream html body on stream req=%s status=%s ctype=%s body=%s",
+                                            req_id,
+                                            resp.status_code,
+                                            content_type,
+                                            err_text[:800].replace("\n", " "),
+                                        )
+                                        err_msg = _html_error_message(err_text, resp.status_code)
                                         for chunk in _stream_error_chunks(source, err_msg, resp.status_code or 502):
                                             mark_first_sse()
                                             yield chunk
-                                        access_stream(status=resp.status_code or 502, extra="result=upstream_non_sse")
+                                        await _note_soft_route_error(resp.status_code or 502)
+                                        access_stream(status=resp.status_code or 502, extra="result=upstream_html")
                                         return
-                                else:
                                     sse_buf = b""
                                     terminal_forwarded = False
                                     async for chunk in _iter_upstream_with_heartbeat(resp):
@@ -2116,6 +2403,9 @@ async def log_and_forward_requests(request: Request, call_next):
                                             leftover_usage = collector.flush() or collector.usage
                                             if leftover_usage:
                                                 await charge_once(leftover_usage)
+                                        # 上游半截流同样是失败（如被网关拦成 HTML、
+                                        # 或节点抖动断连），必须计入软路由，否则切不走。
+                                        await _note_soft_route_error(502)
                                         access_stream(status=502, extra="result=incomplete_stream")
                                         return
 
@@ -2140,6 +2430,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                             for chunk in _stream_error_chunks(source, empty_msg, 502):
                                                 mark_first_sse()
                                                 yield chunk
+                                            await _note_soft_route_error(502)
                                             access_stream(status=502, extra="result=empty_stream")
                                             return
 
@@ -2216,6 +2507,7 @@ async def log_and_forward_requests(request: Request, call_next):
                             if leftover_usage:
                                 await charge_once(leftover_usage)
                         access_stream(status=502, extra="result=incomplete_stream_error")
+                        await _note_soft_route_error(502)
                         return
                     if not should_retry_stream_transport(
                         exc, attempt, client_events, len(body or b""),
@@ -2246,6 +2538,7 @@ async def log_and_forward_requests(request: Request, call_next):
             ):
                 mark_first_sse()
                 yield chunk
+            await _note_soft_route_error(upstream_status or 502)
             access_stream(status=upstream_status or 502, extra="result=stream_error")
             return
         finally:
@@ -2255,6 +2548,7 @@ async def log_and_forward_requests(request: Request, call_next):
                 )
         if upstream_status < 400:
             access_stream(status=upstream_status or 200, extra=compression_extra)
+            await _note_soft_route_ok()
 
     if want_stream:
         process_log.info("handle stream req=%s source=%s", req_id, source)
@@ -2300,8 +2594,54 @@ async def log_and_forward_requests(request: Request, call_next):
                 parsed_body=parsed_body,
             )
         parsed_resp = _parse_json_body(resp.content)
+        # Gemini 原生可能回 JSON 数组（多分片），_parse_json_body 只认对象；
+        # 取最后一个分片拿完整 usageMetadata，响应体本身仍逐字节透传。
+        if not parsed_resp and gemini_native_route and resp.status_code < 400:
+            gemini_items = parse_gemini_stream_payloads(resp.content)
+            if gemini_items:
+                parsed_resp = gemini_items[-1]
+        # 上游 200 回 HTML（区域封锁/网关拦截页）不是合法应答，按上游失败处理，
+        # 否则会被当成成功写进软路由计数、并把整页 HTML 回给客户端。
+        html_on_success = (
+            resp.status_code < 400
+            and not parsed_resp
+            and "text/html" in (resp.headers.get("content-type") or "").lower()
+        )
+        if html_on_success:
+            html_text = (resp.content or b"").decode(errors="ignore")
+            process_log.warning(
+                "upstream html body req=%s status=%s body=%s",
+                req_id,
+                resp.status_code,
+                html_text[:800].replace("\n", " "),
+            )
+            await finish_request_usage(req_id, 502)
+            await _note_soft_route_error(502)
+            _log_access(
+                request,
+                req_id=req_id,
+                user_id=user_id,
+                source=source,
+                model=model,
+                stream=False,
+                status=502,
+                started=started,
+                base_url=upstream_base,
+                done_ms=_elapsed_ms(started),
+                extra="result=upstream_html",
+                result="error",
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "type": "api_error",
+                        "message": _html_error_message(html_text, resp.status_code),
+                    }
+                },
+            )
         if fake_non_stream and resp.status_code < 400:
-            # 上游按流式返回，这里读完整个 SSE 再拼成普通 completion。
+            # 上游按流式返回，这里读完整个 SSE 再拼回普通 JSON。
             raw_parts: list[bytes] = []
             buf = b""
             async for chunk in resp.aiter_bytes():
@@ -2317,9 +2657,25 @@ async def log_and_forward_requests(request: Request, call_next):
                 if obj:
                     fake_chunks.append(obj)
             fake_raw = b"".join(raw_parts)
-            parsed_resp = non_stream_chunk_to_completion(
-                fake_chunks, fallback_model=model if model != "-" else ""
-            ) or {}
+            if source == "responses":
+                # 终止事件里的 response 就是非流式该返回的完整对象。
+                response_obj, failed_message = responses_events_to_response(fake_chunks)
+                if failed_message:
+                    fake_error_message = failed_message
+                    parsed_resp = {}
+                elif response_obj:
+                    parsed_resp = response_obj
+                else:
+                    # 没有终止事件：上游可能没按流式回（仍是普通 JSON），也可能流被截断。
+                    parsed_resp = _parse_json_body(resp.content)
+                    if not parsed_resp and fake_chunks:
+                        fake_error_message = (
+                            "upstream stream ended before response.completed"
+                        )
+            else:
+                parsed_resp = non_stream_chunk_to_completion(
+                    fake_chunks, fallback_model=model if model != "-" else ""
+                ) or {}
             if not parsed_resp:
                 process_log.warning(
                     "fake non-stream got no content req=%s status=%s body=%s",
@@ -2335,6 +2691,11 @@ async def log_and_forward_requests(request: Request, call_next):
                 (resp.content or b"")[:800].decode(errors="ignore").replace("\n", " "),
                 summarize_request_keys(parsed_body),
             )
+        if resp.status_code >= 400:
+            await _note_soft_route_error(resp.status_code)
+        elif not (fake_non_stream and not parsed_resp):
+            # 伪非流式聚合失败会在下面按 502 返回，这里不能算成功。
+            await _note_soft_route_ok()
         if anthropic_bridge and resp.status_code >= 400:
             await finish_request_usage(req_id, resp.status_code)
             err = (parsed_resp or {}).get("error") if isinstance(parsed_resp, dict) else None
@@ -2572,9 +2933,10 @@ async def log_and_forward_requests(request: Request, call_next):
         if fake_non_stream and resp.status_code < 400:
             if not parsed_resp:
                 # 上游只回了空 choices，聚合不出正常应答。直接报错，别把空 SSE 当成功。
-                message = _extract_upstream_error_message(
+                message = fake_error_message or _extract_upstream_error_message(
                     fake_raw.decode(errors="ignore"), resp.status_code
                 )
+                await _note_soft_route_error(502)
                 _log_access(
                     request,
                     req_id=req_id,
@@ -2635,6 +2997,7 @@ async def log_and_forward_requests(request: Request, call_next):
     except Exception:
         await finish_request_usage(req_id, 502)
         process_log.exception("forward error req=%s user=%s", req_id, user_id)
+        await _note_soft_route_error(502)
         _log_access(
             request,
             req_id=req_id,
@@ -2667,6 +3030,7 @@ class VendorUpsert(BaseModel):
     profit_multiplier: Optional[float] = Field(default=None, gt=0, le=100)
     cost_usd_cny_rate: Optional[float] = Field(default=None, gt=0, le=100)  # 真实采购汇率，仅算成本/利润
     api_key: Optional[str] = Field(default=None, max_length=512)
+    use_proxy: Optional[bool] = None  # 转发该号商时是否走 TEAMO_HTTP_PROXY
     is_active: bool = True
     is_default: bool = False
     sort_order: int = 100
@@ -2731,6 +3095,21 @@ class UserModelPriceUpsert(BaseModel):
     note: str = ""
 
 
+class SoftRouteUpsert(BaseModel):
+    id: Optional[int] = None
+    model: str = Field(min_length=1, max_length=255)
+    to_vendor_code: str = Field(min_length=1, max_length=64)
+    # 空表示任意来源号商都适用
+    from_vendor_code: Optional[str] = Field(default=None, max_length=64)
+    fail_threshold: int = Field(default=2, ge=1, le=20)
+    duration_seconds: int = Field(default=300, ge=10, le=86400)
+    is_active: bool = True
+    note: str = ""
+    group_name: Optional[str] = Field(default=None, max_length=128)
+    # 分组批量：一条规则一次展开成多条
+    models: Optional[list[str]] = None
+
+
 class ModelRouteKeyReplace(BaseModel):
     model: str = Field(min_length=1, max_length=255)
     api_key: str = Field(min_length=1, max_length=512)
@@ -2740,12 +3119,15 @@ class VendorKeyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     api_key: str = Field(min_length=1, max_length=512)
     note: str = ""
+    # 绑定调用协议：openai | anthropic | responses；空=通用 Key
+    protocol: str = Field(default="", max_length=32)
 
 
 class VendorKeyUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=128)
     api_key: Optional[str] = Field(default=None, max_length=512)
     note: Optional[str] = None
+    protocol: Optional[str] = Field(default=None, max_length=32)
     is_active: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -2831,6 +3213,102 @@ async def _get_api_user(request: Request):
     if user is None:
         return None, JSONResponse(status_code=403, content={"error": "invalid API key"})
     return user, None
+
+
+def _local_models_for_user(user_key: str = "") -> dict:
+    """本地汇总可用模型：当前供应商价目 + 路由规则 + 别名。
+
+    不再向上游拉 /v1/models：客户端能调什么，只由「供应商价目里有的」
+    和「路由显式指定的」决定，两边都不依赖上游接口是否可用。
+    """
+    from utils.common_utils import to_client_model_id
+    from utils.model_alias import infer_protocol
+
+    # 鉴权拿到的是手机号，路由名单存的是用户主键，需经同一套映射。
+    user_id = route_user_id_from_key(user_key) if user_key else None
+
+    protocol_rules = list_protocols(active_only=True)
+    entries: dict[str, dict] = {}
+    created = int(time.time())
+
+    def add(model: str, *, owned_by: str = "", vendor: str = "") -> None:
+        model_id = to_client_model_id(model)
+        if not model_id or model_id == "*":
+            return
+        key = model_id.strip().lower()
+        if not key:
+            return
+        rule = match_model_protocol(key, protocol_rules)
+        protocol = rule["protocol"] if rule else infer_protocol(key)
+        item = entries.get(key)
+        if item is None:
+            entries[key] = {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "owned_by": owned_by or vendor or "",
+                "protocol": protocol,
+            }
+            return
+        # 同一模型在多个供应商都有：保留首个来源，补全缺失字段。
+        if not item.get("owned_by") and (owned_by or vendor):
+            item["owned_by"] = owned_by or vendor
+
+    # 1) 当前默认供应商的价目表
+    try:
+        _meta, catalog = get_vendor_catalog()
+        for row in catalog:
+            add(row.get("model") or "", owned_by=row.get("owned_by") or "", vendor=(row.get("vendor") or ""))
+    except Exception:
+        process_log.exception("build local model list from catalog failed")
+
+    # 2) 命中该用户的路由（模型可能不在默认供应商价目里）
+    try:
+        for rule in list_routes(active_only=True):
+            if not rule_applies_to_user(rule, user_id):
+                continue
+            route_model = (rule.get("model") or "").strip()
+            if not route_model:
+                continue
+            # 路由支持 gpt-* / gemini* 这类通配，通配本身不是可直接调用的模型名。
+            if "*" in route_model:
+                continue
+            add(route_model, vendor=rule.get("vendor_code") or "")
+    except Exception:
+        process_log.exception("build local model list from routes failed")
+
+    # 3) 别名：对外只暴露 alias，hide_target 时隐藏真实模型名
+    alias_rules = list_aliases(active_only=True)
+    hidden = {
+        (item.get("target_model") or "").strip().lower()
+        for item in alias_rules
+        if item.get("hide_target") and item.get("target_model")
+    }
+    for target in hidden:
+        entries.pop(target, None)
+    for rule in alias_rules:
+        alias = (rule.get("alias") or "").strip()
+        if not alias:
+            continue
+        protocol = resolved_protocol(rule)
+        entries[alias.lower()] = {
+            "id": alias,
+            "object": "model",
+            "created": created,
+            "owned_by": entries.get((rule.get("target_model") or "").lower(), {}).get("owned_by") or "",
+            "protocol": protocol,
+        }
+
+    data = sorted(entries.values(), key=lambda item: item["id"].lower())
+    return {
+        "object": "list",
+        "data": data,
+        "protocol_routes": [
+            {"model": item["model"], "protocol": item["protocol"]}
+            for item in protocol_rules
+            if item.get("model") and item.get("protocol")
+        ],
+    }
 
 
 @app.get("/v1/vendors")
@@ -3018,6 +3496,7 @@ async def admin_upsert_vendor(payload: VendorUpsert, request: Request):
             profit_multiplier=payload.profit_multiplier,
             cost_usd_cny_rate=payload.cost_usd_cny_rate,
             api_key=payload.api_key,
+            use_proxy=payload.use_proxy,
             is_active=payload.is_active,
             is_default=payload.is_default,
             sort_order=payload.sort_order,
@@ -3049,6 +3528,7 @@ async def admin_create_vendor_key(code: str, payload: VendorKeyCreate, request: 
     try:
         key = await create_vendor_key(
             code=code, name=payload.name, api_key=payload.api_key, note=payload.note,
+            protocol=payload.protocol,
         )
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -3063,7 +3543,8 @@ async def admin_update_vendor_key(code: str, key_id: int, payload: VendorKeyUpda
     try:
         key = await update_vendor_key(
             code=code, key_id=key_id, name=payload.name, api_key=payload.api_key,
-            note=payload.note, is_active=payload.is_active, is_default=payload.is_default,
+            note=payload.note, protocol=payload.protocol,
+            is_active=payload.is_active, is_default=payload.is_default,
         )
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -3349,6 +3830,73 @@ async def admin_delete_model_route(route_id: int, request: Request):
     if not ok:
         return JSONResponse(status_code=404, content={"error": "route not found"})
     return {"ok": True, "routes": list_routes()}
+
+
+@app.get("/v1/admin/soft-routes")
+async def admin_list_soft_routes(request: Request):
+    """软路由规则 + 当前生效中的临时切换（进程内存 + DB 状态表）。"""
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    return {
+        "routes": list_soft_routes(),
+        "active": list_active_soft_routes(),
+        "vendors": list_vendors(include_pricing_meta=True),
+    }
+
+
+@app.put("/v1/admin/soft-routes")
+async def admin_upsert_soft_route(payload: SoftRouteUpsert, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    try:
+        row = await upsert_soft_route(
+            model=payload.model,
+            to_vendor_code=payload.to_vendor_code,
+            from_vendor_code=payload.from_vendor_code or "",
+            fail_threshold=payload.fail_threshold,
+            duration_seconds=payload.duration_seconds,
+            is_active=payload.is_active,
+            note=payload.note,
+            route_id=payload.id,
+            group_name=payload.group_name,
+            models=payload.models,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return {
+        "ok": True,
+        "route": row,
+        "routes": list_soft_routes(),
+        "active": list_active_soft_routes(),
+    }
+
+
+@app.delete("/v1/admin/soft-routes/{route_id}")
+async def admin_delete_soft_route(route_id: int, request: Request):
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    ok = await delete_soft_route(route_id)
+    if not ok:
+        return JSONResponse(status_code=404, content={"error": "soft route not found"})
+    return {"ok": True, "routes": list_soft_routes(), "active": list_active_soft_routes()}
+
+
+@app.post("/v1/admin/soft-routes/clear-active")
+async def admin_clear_soft_route_active(request: Request):
+    """手动解除全部临时切换并清零失败计数（规则保留）。"""
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    cleared = await clear_active_states()
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "routes": list_soft_routes(),
+        "active": list_active_soft_routes(),
+    }
 
 
 @app.get("/v1/admin/user-model-prices")

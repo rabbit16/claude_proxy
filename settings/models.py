@@ -194,6 +194,8 @@ class UpstreamVendor(Base):
     name = Column(String(128), nullable=False, default="")
     base_url = Column(String(512), nullable=False, index=True)
     api_key = Column(String(512), nullable=True)  # 转发到该号商时使用的上游密钥
+    # 转发到该号商时是否走 TEAMO_HTTP_PROXY（区域封锁/需要固定出口的号商打开）
+    use_proxy = Column(Boolean, nullable=False, default=False, server_default="0")
     # 存量 api_key 是否已迁到 tb_upstream_vendor_key；迁过就不再自动重建，避免删掉后被重新插入
     key_migration_done = Column(Boolean, nullable=False, default=False, server_default="0")
     pricing_url = Column(String(512), nullable=True)
@@ -223,6 +225,8 @@ class UpstreamVendorKey(Base):
     vendor_id = Column(Integer, ForeignKey("tb_upstream_vendor.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(128), nullable=False, default="")
     api_key = Column(String(512), nullable=False)
+    # 该 Key 绑定的调用协议：openai / anthropic / responses；空=不绑定（沿用旧的默认 Key 逻辑）
+    protocol = Column(String(32), nullable=False, default="", server_default="")
     is_default = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
     note = Column(String(200), nullable=False, default="")
@@ -251,6 +255,57 @@ class ModelRoute(Base):
     is_active = Column(Boolean, nullable=False, default=True)
     note = Column(String(200), nullable=False, default="")
     created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class SoftRoute(Base):
+    """临时软路由规则：同一模型对同一号商连续失败超过阈值后，短时全量切到备用号商。
+
+    规则本身落库；触发状态与连续失败计数只存进程内存，重启即清空。
+    model 支持完整名、以 - 为边界的前缀，以及 gemini* 这类开头通配。
+    from_vendor_code 为空表示「任意号商」；group_name 非空表示多个模型同属一组。
+    """
+    __tablename__ = "tb_soft_route"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model = Column(String(255), nullable=False, unique=True, index=True)
+    group_name = Column(String(128), nullable=False, default="", index=True)
+    from_vendor_code = Column(String(64), nullable=False, default="", index=True)  # 空=任意
+    to_vendor_code = Column(String(64), nullable=False, index=True)
+    fail_threshold = Column(Integer, nullable=False, default=2)
+    duration_seconds = Column(Integer, nullable=False, default=300)
+    is_active = Column(Boolean, nullable=False, default=True)
+    note = Column(String(200), nullable=False, default="")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class SoftRouteEpoch(Base):
+    """软路由运行世代。单行 id=1。
+
+    epoch 为空表示当前没有存活的 worker；worker_marks 记录各 worker 的 pid + 进程启动
+    时刻，用于判断「整个服务重启」还是「单个 worker 重启」。
+    """
+    __tablename__ = "tb_soft_route_epoch"
+    id = Column(Integer, primary_key=True, default=1)
+    epoch = Column(String(64), nullable=False, default="")
+    worker_marks = Column(JSON, nullable=True)
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class SoftRouteState(Base):
+    """软路由运行态：连续失败计数 + 生效窗口，按运行世代隔离。
+
+    run_epoch 标识一次服务启动（多 worker 共享同一世代）。进程重启后世代变化，
+    旧世代的记录不再被采用，等于路由消失；单个 worker 重启不清掉其它 worker 的状态。
+    """
+    __tablename__ = "tb_soft_route_state"
+    model = Column(String(255), primary_key=True)
+    from_vendor_code = Column(String(64), primary_key=True, default="")
+    run_epoch = Column(String(64), nullable=False, default="", index=True)
+    fail_count = Column(Integer, nullable=False, default=0)
+    rule_id = Column(Integer, nullable=True)
+    to_vendor_code = Column(String(64), nullable=False, default="")
+    active_until = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
 

@@ -114,6 +114,17 @@ def _replace_json_body(body: bytes, updated: dict) -> tuple[bytes, dict]:
     return body, updated
 
 
+def _body_has_model(body: bytes) -> bool:
+    stripped = body.lstrip() if body else b""
+    if not (stripped.startswith(b"{") or stripped.startswith(b"[")):
+        return False
+    try:
+        original = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(original, dict) and isinstance(original.get("model"), str)
+
+
 def apply_alias_to_request(body: bytes, parsed_body: dict) -> tuple[bytes, dict, Optional[dict]]:
     if not isinstance(parsed_body, dict):
         return body, parsed_body, None
@@ -125,7 +136,9 @@ def apply_alias_to_request(body: bytes, parsed_body: dict) -> tuple[bytes, dict,
         return body, parsed_body, None
     updated = dict(parsed_body)
     updated["model"] = rule["target_model"]
-    new_body, new_parsed = _replace_json_body(body, updated)
+    # Gemini 原生请求体没有 model 字段，模型名只在路径里；这里只改 parsed，
+    # 否则会把上游不认的 model 字段塞进请求体。
+    new_body, new_parsed = _replace_json_body(body, updated) if _body_has_model(body) else (body, updated)
     return new_body, new_parsed, rule
 
 

@@ -181,6 +181,16 @@ curl http://127.0.0.1:4000/v1/messages \
 
 不带 `/v1` 前缀的等价路径（`/messages`、`/chat/completions` 等）同样可用。
 
+Gemini 原生入口：
+
+- 鉴权用 `Authorization: Bearer <key>`（与其它接口一致）；客户端带 `?key=` 或 `x-goog-api-key`
+  只用于我们这边的鉴权，转发前会被剔除，不会带到上游。
+- `:streamGenerateContent` 带 `?alt=sse`（或 `Accept: text/event-stream`）时按 SSE 下发；
+  不带时把上游返回的 JSON 数组原样透传（缓冲到结束再返回）。
+- 上游不支持 `alt=sse`、回 JSON 数组时，流式请求会自动把分片逐条转成 `data:` 事件。
+- 当前只放开生图模型（如 `gemini-3.1-flash-image`）：没有生图价目的 Gemini 文本模型返回 400，
+  避免用图片价目误计费。
+
 ### 查询与管理接口
 
 ```bash

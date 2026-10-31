@@ -16,6 +16,7 @@ from utils.vendor_catalog import (
     vendor_default_key_secret,
     vendor_key_label,
     vendor_key_secret,
+    vendor_protocol_key_secret,
 )
 
 # 按 model 长度降序，便于最长前缀命中
@@ -111,6 +112,11 @@ def _public_route(item: dict) -> dict:
     key_id = out.get("api_key_id")
     out["key_name"] = vendor_key_label(out.get("vendor_code") or "", key_id) if key_id else ""
     return out
+
+
+def route_user_id_from_key(user_key: str) -> Optional[int]:
+    """公开包装：把鉴权得到的手机号/用户主键解析成路由名单里的用户主键。"""
+    return _user_id_from_key(user_key)
 
 
 def _user_id_from_key(user_key: str) -> Optional[int]:
@@ -266,36 +272,71 @@ def match_model_route(model: str, user_id: Optional[int] = None) -> Optional[dic
     return dict(best) if best else None
 
 
-def resolve_runtime_for_model(model: str, user_key: str = "") -> dict:
+def resolve_runtime_for_model(
+    model: str, user_key: str = "", protocol: str = "",
+) -> dict:
     """请求转发/计费用的运行时。未命中规则时回退全局默认供应商。
 
     user_key 是鉴权得到的手机号。只有被写进规则的用户会改走对应厂商。
+    软路由生效时（某号商对该模型连续失败），本轮全量改走备用号商。
+    protocol（openai/anthropic/responses）用于挑该号商绑定的同协议 Key，
+    未绑定协议时沿用旧的「默认 Key」逻辑。
     """
+    proto = (protocol or "").strip().lower()
     rule = match_model_route(model, user_id=_user_id_from_key(user_key))
     default = get_runtime_upstream()
-    if not rule:
-        return default
-    override = get_runtime_upstream(vendor=rule["vendor_code"])
-    if not override or not override.get("code"):
-        return default
-    # 优先级：规则临时覆盖 Key > 规则指定的命名 Key > 该供应商默认命名 Key
-    # 后续调用方再用 vendor 兜底 Key / 全局 Key
-    route_key = (rule.get("api_key") or "").strip()
-    key_id = rule.get("api_key_id")
-    if not route_key:
-        if key_id:
-            route_key = vendor_key_secret(rule["vendor_code"], key_id)
-        else:
-            route_key = vendor_default_key_secret(rule["vendor_code"])
-    same_vendor = override.get("code") == default.get("code")
-    if same_vendor and not route_key:
-        return default
-    out = dict(default if same_vendor else override)
-    out["route_model"] = rule["model"]
-    out["routed"] = True
-    if route_key:
-        out["route_api_key"] = route_key
-    return out
+    if rule:
+        override = get_runtime_upstream(vendor=rule["vendor_code"])
+        if override and override.get("code"):
+            # 优先级：规则临时覆盖 Key > 规则指定的命名 Key >
+            #        该供应商按协议绑定的 Key > 该供应商默认命名 Key
+            # 后续调用方再用 vendor 兜底 Key / 全局 Key
+            route_key = (rule.get("api_key") or "").strip()
+            key_id = rule.get("api_key_id")
+            if not route_key:
+                if key_id:
+                    route_key = vendor_key_secret(rule["vendor_code"], key_id)
+                else:
+                    route_key = (
+                        vendor_protocol_key_secret(rule["vendor_code"], proto)
+                        or vendor_default_key_secret(rule["vendor_code"])
+                    )
+            same_vendor = override.get("code") == default.get("code")
+            if not (same_vendor and not route_key):
+                out = dict(default if same_vendor else override)
+                out["route_model"] = rule["model"]
+                out["routed"] = True
+                if route_key:
+                    out["route_api_key"] = route_key
+                return _apply_soft_route(model, out, proto)
+    return _apply_soft_route(model, default, proto)
+
+
+def _apply_soft_route(model: str, runtime: dict, protocol: str = "") -> dict:
+    """软路由命中时把运行时整体替换为备用号商。未命中原样返回。"""
+    try:
+        from utils.soft_route import resolve_soft_route
+        state = resolve_soft_route(model, runtime.get("code") or "")
+        if not state:
+            return runtime
+        target = get_runtime_upstream(vendor=state["to_vendor_code"])
+        if not target or not target.get("code"):
+            return runtime
+        out = dict(target)
+        out["routed"] = True
+        out["soft_routed"] = True
+        out["soft_from_vendor"] = runtime.get("code") or ""
+        out["soft_until"] = state.get("active_until")
+        key = (
+            vendor_protocol_key_secret(state["to_vendor_code"], protocol)
+            or vendor_default_key_secret(state["to_vendor_code"])
+        )
+        if key:
+            out["route_api_key"] = key
+        return out
+    except Exception:
+        process_log.exception("apply soft route failed model=%s", model)
+        return runtime
 
 
 def overlay_catalog_rows(
@@ -414,6 +455,10 @@ async def upsert_route(
         ids = normalize_user_ids(user_ids)
         if len(ids) > 500:
             raise ValueError("too many users on one route")
+
+    async with AsyncSessionLocal() as db:
+        # 名单校验必须在会话内查库：之前放在 async with 之外，db 尚未定义，
+        # 只要提交了「适用用户」就抛 NameError 500。
         if ids:
             found = set((await db.execute(
                 select(User.user_id).where(User.user_id.in_(ids))
@@ -421,8 +466,6 @@ async def upsert_route(
             missing = [item for item in ids if item not in found]
             if missing:
                 raise ValueError(f"unknown user: {missing[0]}")
-
-    async with AsyncSessionLocal() as db:
         existing = list((await db.execute(select(ModelRoute))).scalars().all())
         by_model = {row.model: row for row in existing}
         target_row = next((row for row in existing if route_id and row.id == route_id), None)

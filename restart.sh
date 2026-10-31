@@ -8,6 +8,19 @@ set -euo pipefail
 # 默认按脚本所在目录部署，换机器后 clone 到任意路径都能直接跑。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${APP_DIR:-$SCRIPT_DIR}"
+# 优先用 conda 环境里的 3.12：系统 /usr/bin/python3 在部分机器上是 3.6，
+# 连 `from __future__ import annotations` 都不支持，预检会直接 SyntaxError。
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+  for candidate in \
+    /root/anaconda3/envs/claude_code/bin/python3.12 \
+    /root/miniconda3/envs/claude_code/bin/python3.12; do
+    if [[ -x "$candidate" ]]; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
 PYTHON="${PYTHON:-$(command -v python3 || echo /root/anaconda3/envs/claude_code/bin/python3.12)}"
 PORT="${PORT:-${APP_PORT:-4000}}"
 PID_FILE="${PID_FILE:-$APP_DIR/proxy.pid}"
@@ -35,6 +48,8 @@ fi
 export TEAMO_API_KEY_FILE="${TEAMO_API_KEY_FILE:-/etc/claude_code_proxy/teamo_api_key}"
 # 上游 api.teamorouter.cn 国内可直连，默认不再走本机 FlClash。
 export TEAMO_HTTP_PROXY="${TEAMO_HTTP_PROXY:-}"
+# 后台勾了 use_proxy 的号商（如 duck）走这个代理；留空回落到 TEAMO_HTTP_PROXY。
+export VENDOR_HTTP_PROXY="${VENDOR_HTTP_PROXY:-}"
 # 压缩会改写已缓存的历史。启动时固定关闭，避免继承到的环境变量把它打开。
 export HEADROOM_ENABLED=0
 export HEADROOM_KOMPRESS=0
@@ -105,7 +120,7 @@ start_proxy() {
     exit 1
   fi
 
-  log "starting: $PYTHON main.py (cwd=$APP_DIR, port=$PORT, proxy=${TEAMO_HTTP_PROXY})"
+  log "starting: $PYTHON main.py (cwd=$APP_DIR, port=$PORT, proxy=${TEAMO_HTTP_PROXY} vendor_proxy=${VENDOR_HTTP_PROXY})"
   # 脱离 SSH/终端；日志追加到 nohup.out
   setsid "$PYTHON" main.py >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!

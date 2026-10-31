@@ -32,6 +32,7 @@ from settings.macro import (
     TEAMO_MODEL_MONEY_DICT,
     TEAMO_UPSTREAM_BASE,
     UPSTREAM_PROVIDER,
+    VENDOR_HTTP_PROXY,
     YUNXIN_UPSTREAM_BASE,
     LEGACY_UPSTREAM_BASE,
 )
@@ -669,6 +670,7 @@ async def reload_cache_from_db() -> None:
                 "id": key.id,
                 "name": key.name or "",
                 "api_key": (key.api_key or "").strip(),
+                "protocol": (getattr(key, "protocol", "") or "").strip().lower(),
                 "is_default": bool(key.is_default),
                 "is_active": bool(key.is_active),
                 "note": key.note or "",
@@ -680,6 +682,7 @@ async def reload_cache_from_db() -> None:
                 "name": vendor.name,
                 "base_url": vendor.base_url,
                 "api_key": (getattr(vendor, "api_key", None) or "").strip(),
+                "use_proxy": bool(getattr(vendor, "use_proxy", False)),
                 "keys": keys_by_vendor.get(vendor.id, []),
                 "pricing_url": vendor.pricing_url,
                 "pricing_mode": getattr(vendor, "pricing_mode", None) or PRICING_MODE_MANUAL,
@@ -756,6 +759,8 @@ def get_runtime_upstream(*, vendor: str = "") -> dict:
         "pricing_url": (meta or {}).get("pricing_url"),
         "teamo": code == "teamo",
         "yunxin": code == "yunxin",
+        # teamo 一直走代理；其它号商按后台 use_proxy 开关决定
+        "use_proxy": code == "teamo" or bool((meta or {}).get("use_proxy")),
         "legacy": code not in {"teamo", "yunxin"},
         "last_synced_at": (meta or {}).get("last_synced_at"),
         "profit_multiplier": (meta or {}).get("profit_multiplier"),
@@ -831,12 +836,37 @@ def vendor_api_key(code: str = "") -> str:
 
 
 def vendor_default_key_secret(code: str) -> str:
-    """供应商标记为默认的命名 Key；没有则返回空串。"""
+    """供应商标记为默认的命名 Key；没有则返回空串。
+
+    绑定了协议的 Key 不当通用默认值，否则「openai 专用 Key」会被 anthropic 请求用上。
+    """
     code = (code or "").strip().lower()
     meta = _vendor_meta.get(code) or {}
     for key in meta.get("keys") or []:
+        if (key.get("protocol") or "").strip():
+            continue
         if key.get("is_default"):
             return (key.get("api_key") or "").strip()
+    return ""
+
+
+def vendor_protocol_key_secret(code: str, protocol: str) -> str:
+    """按调用协议取供应商绑定的 Key；没绑定则返回空串，调用方回落旧逻辑。
+
+    同一号商不同协议（openai / anthropic / responses）可能要不同 Key，
+    比如 duck 的 deepseek 口子。绑定在 tb_upstream_vendor_key.protocol。
+    """
+    proto = (protocol or "").strip().lower()
+    if not proto:
+        return ""
+    code = (code or "").strip().lower()
+    meta = _vendor_meta.get(code) or {}
+    for key in meta.get("keys") or []:
+        if (key.get("protocol") or "").strip().lower() != proto:
+            continue
+        secret = (key.get("api_key") or "").strip()
+        if secret:
+            return secret
     return ""
 
 
@@ -891,6 +921,7 @@ async def list_vendor_keys(code: str) -> list[dict]:
             "id": row.id,
             "name": row.name or "",
             "api_key_hint": _mask_api_key((row.api_key or "").strip()),
+            "protocol": (getattr(row, "protocol", "") or ""),
             "is_default": bool(row.is_default),
             "is_active": bool(row.is_active),
             "note": row.note or "",
@@ -907,10 +938,23 @@ async def _clear_other_defaults(db, vendor_id: int, keep_id: int) -> None:
         other.is_default = other.id == keep_id
 
 
-async def create_vendor_key(*, code: str, name: str, api_key: str, note: str = "") -> dict:
+VALID_KEY_PROTOCOLS = {"", "openai", "anthropic", "responses"}
+
+
+def _norm_key_protocol(protocol: Optional[str]) -> str:
+    proto = (protocol or "").strip().lower()
+    if proto not in VALID_KEY_PROTOCOLS:
+        raise ValueError(f"protocol must be one of {sorted(p for p in VALID_KEY_PROTOCOLS if p)}")
+    return proto
+
+
+async def create_vendor_key(
+    *, code: str, name: str, api_key: str, note: str = "", protocol: str = "",
+) -> dict:
     code = (code or "").strip().lower()
     name = (name or "").strip()
     api_key = (api_key or "").strip()
+    proto = _norm_key_protocol(protocol)
     if not name:
         raise ValueError("name is required")
     if not api_key:
@@ -937,7 +981,9 @@ async def create_vendor_key(*, code: str, name: str, api_key: str, note: str = "
             vendor_id=vendor.id,
             name=name,
             api_key=api_key,
-            is_default=is_first,
+            protocol=proto,
+            # 绑定了协议的 Key 只服务于该协议，不抢「通用默认 Key」的位置
+            is_default=is_first and not proto,
             is_active=True,
             note=(note or "")[:200],
         )
@@ -960,6 +1006,7 @@ async def update_vendor_key(
     name: Optional[str] = None,
     api_key: Optional[str] = None,
     note: Optional[str] = None,
+    protocol: Optional[str] = None,
     is_active: Optional[bool] = None,
     is_default: Optional[bool] = None,
 ) -> dict:
@@ -996,6 +1043,11 @@ async def update_vendor_key(
             row.api_key = new_key
         if note is not None:
             row.note = (note or "")[:200]
+        if protocol is not None:
+            row.protocol = _norm_key_protocol(protocol)
+            # 协议专用 Key 不能同时当通用默认 Key，否则会串到别的协议
+            if row.protocol:
+                row.is_default = False
         if is_active is not None:
             if not is_active:
                 # 停用前挡住：被路由引用的 Key 停用后会静默掉到兜底 Key，容易误判
@@ -1006,6 +1058,8 @@ async def update_vendor_key(
                     raise ValueError("该 Key 仍被模型路由引用，请先改掉那些路由再停用")
             row.is_active = bool(is_active)
         if is_default:
+            if row.protocol:
+                raise ValueError("绑定了协议的 Key 不能设为默认 Key")
             await _clear_other_defaults(db, vendor.id, row.id)
             row.is_default = True
         try:
@@ -1125,6 +1179,7 @@ def list_vendors(*, include_pricing_meta: bool = False) -> list[dict]:
             item.pop("catalog_policy", None)
             item.pop("profit_multiplier", None)
             item.pop("cost_usd_cny_rate", None)
+            item.pop("use_proxy", None)
             item.pop("keys", None)
         items.append(item)
     return items
@@ -1383,8 +1438,11 @@ async def refresh_vendor_prices(vendor_code: str = "", *, force: bool = False) -
                 "timeout": httpx.Timeout(20.0, connect=8.0),
                 "trust_env": False,
             }
-            if code == "teamo" and TEAMO_HTTP_PROXY:
-                client_kwargs["proxy"] = TEAMO_HTTP_PROXY
+            proxy_url = TEAMO_HTTP_PROXY if code == "teamo" else (
+                VENDOR_HTTP_PROXY if meta.get("use_proxy") else None
+            )
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
             async with httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.get(pricing_url)
                 resp.raise_for_status()
@@ -1514,6 +1572,7 @@ async def create_or_update_vendor(
     profit_multiplier: Optional[float] = None,
     cost_usd_cny_rate: Optional[float] = None,
     api_key: Optional[str] = None,
+    use_proxy: Optional[bool] = None,
     is_active: bool = True,
     is_default: bool = False,
     sort_order: int = 100,
@@ -1579,6 +1638,10 @@ async def create_or_update_vendor(
             row.cost_usd_cny_rate = None
         if api_key is not None:
             row.api_key = (api_key or "").strip() or None
+        if use_proxy is not None:
+            row.use_proxy = bool(use_proxy)
+        elif row.id is None:
+            row.use_proxy = False
         row.is_active = bool(is_active)
         row.sort_order = int(sort_order)
         if is_default:
@@ -1627,6 +1690,8 @@ async def ensure_vendor_schema_columns(conn) -> None:
         "ALTER TABLE tb_upstream_vendor ADD COLUMN cost_rate DOUBLE NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN profit_multiplier DOUBLE NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN api_key VARCHAR(512) NULL",
+        "ALTER TABLE tb_upstream_vendor ADD COLUMN use_proxy TINYINT(1) NOT NULL DEFAULT 0",
+        "ALTER TABLE tb_upstream_vendor_key ADD COLUMN protocol VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN key_migration_done TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN catalog_policy JSON NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN cost_usd_cny_rate DOUBLE NULL",

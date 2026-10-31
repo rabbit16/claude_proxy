@@ -4,7 +4,7 @@ import re
 import time
 from typing import Any, Dict, Optional
 
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from settings.macro import (
     CACHE_INPUT_INCLUDES_CACHE,
@@ -85,6 +85,9 @@ AUDIO_PATH_PREFIX = "/v1/audio/"
 GEMINI_NATIVE_PATH_RE = re.compile(
     r"^/v1beta/models/([^/:]+):(generateContent|streamGenerateContent)$"
 )
+GEMINI_STREAM_PATH_RE = re.compile(
+    r"^/v1beta/models/([^/:]+):streamGenerateContent$"
+)
 
 HOP_BY_HOP_HEADERS = {
     "host",
@@ -150,6 +153,73 @@ def replace_gemini_model_in_path(path: str, model: str) -> str:
     if not match or not name or name == "-" or "/" in name or ":" in name:
         return path
     return f"/v1beta/models/{name}:{match.group(2)}"
+
+
+def is_gemini_stream_path(path: str) -> bool:
+    return bool(GEMINI_STREAM_PATH_RE.match(path or ""))
+
+
+def wants_gemini_sse(query: str, accept: str = "") -> bool:
+    """Gemini 原生流式：?alt=sse 或客户端 Accept SSE 时按 SSE 下发。"""
+    for key, value in parse_qsl(query or "", keep_blank_values=True):
+        if key.lower() == "alt" and value.strip().lower() == "sse":
+            return True
+    return "text/event-stream" in (accept or "").lower()
+
+
+def gemini_upstream_query(query: str, *, force_sse: bool = False) -> str:
+    """转给上游的 Gemini 查询串：丢掉客户端凭据 key，按需补 alt=sse。
+
+    客户端的 key 只用于我们的鉴权，绝不能带到上游；否则既泄露密钥，
+    又可能让上游按它自己的 key 校验而导致鉴权失败。
+    """
+    pairs = []
+    has_alt = False
+    for key, value in parse_qsl(query or "", keep_blank_values=True):
+        lowered = key.lower()
+        if lowered == "key":
+            continue
+        if lowered == "alt":
+            has_alt = True
+            if force_sse:
+                value = "sse"
+        pairs.append((key, value))
+    if force_sse and not has_alt:
+        pairs.append(("alt", "sse"))
+    return urlencode(pairs)
+
+
+def parse_gemini_stream_payloads(raw: bytes) -> list[dict]:
+    """解析 Gemini 流式响应体，兼容 JSON 数组 / 单个对象 / NDJSON 三种形态。
+
+    官方 :streamGenerateContent 默认回 JSON 数组，带 alt=sse 才回 SSE；
+    部分中转直接逐行吐 JSON。解析失败返回空列表，由调用方按错误处理。
+    """
+    text = (raw or b"").decode("utf-8", errors="replace").strip()
+    if not text:
+        return []
+    try:
+        loaded = json.loads(text)
+    except Exception:
+        loaded = None
+    if isinstance(loaded, list):
+        return [item for item in loaded if isinstance(item, dict)]
+    if isinstance(loaded, dict):
+        return [loaded]
+    items = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line == "[DONE]":
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            items.append(obj)
+    return items
 
 
 def is_models_path(path: str) -> bool:
@@ -1805,6 +1875,25 @@ def auth_fail_message(reason: str) -> str:
     return f"该账户{reason}。"
 
 
+def gemini_error_payload(message: str, reason: str, status_code: int = 0) -> dict:
+    """Google API 的错误体形状；Gemini SDK 只认 error.code/message/status。"""
+    if reason == "not exist":
+        code, status = 401, "UNAUTHENTICATED"
+    elif reason == "no money":
+        code, status = 403, "PERMISSION_DENIED"
+    elif (status_code or 0) >= 500:
+        code, status = status_code, "UNAVAILABLE"
+    else:
+        code, status = status_code or 400, "INVALID_ARGUMENT"
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "status": status,
+        }
+    }
+
+
 def build_error_payload(source: str, message: str, reason: str) -> dict:
     error_type = "authentication_error" if reason == "not exist" else "permission_error"
     if source == "anthropic":
@@ -1815,6 +1904,8 @@ def build_error_payload(source: str, message: str, reason: str) -> dict:
                 "message": message,
             },
         }
+    if source == "gemini":
+        return gemini_error_payload(message, reason, auth_fail_status(reason))
     openai_type = "invalid_request_error" if reason == "not exist" else "insufficient_quota"
     return {
         "error": {
@@ -1829,7 +1920,7 @@ def auth_fail_status(reason: str) -> int:
     return 401 if reason == "not exist" else 403
 
 
-def common_message_yield(message: str, source: str = "openai"):
+def common_message_yield(message: str, source: str = "openai", reason: str = ""):
     """按客户端协议返回一段可读的流式错误。"""
     text = message if message.endswith("。") else f"该账户{message}。"
     now = int(time.time())
@@ -1847,6 +1938,12 @@ def common_message_yield(message: str, source: str = "openai"):
             "error": {"type": "invalid_request_error", "message": text},
         }
         yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+        return
+
+    if source == "gemini":
+        # Gemini 流式没有 [DONE]，错误以一条 data: 事件下发。
+        payload = gemini_error_payload(text, reason or "no money", 403)
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
         return
 
     chunk_obj = {

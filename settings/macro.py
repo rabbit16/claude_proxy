@@ -38,6 +38,9 @@ VENDOR_UPSTREAM = UPSTREAM_PROVIDER == "yunxin"
 TEAMO_UPSTREAM_BASE = os.environ.get("TEAMO_UPSTREAM_BASE", "https://api.teamorouter.cn").strip().rstrip("/")
 # 仅远端直连受阻时设置，如 http://127.0.0.1:7890；留空则直连。
 TEAMO_HTTP_PROXY = os.environ.get("TEAMO_HTTP_PROXY", "").strip() or None
+# 普通号商（后台 use_proxy 勾选）使用的代理。teamo 可直连时不必给全局设代理，
+# 单独给需要固定出口的号商配；未设置则回落到 TEAMO_HTTP_PROXY。
+VENDOR_HTTP_PROXY = os.environ.get("VENDOR_HTTP_PROXY", "").strip() or TEAMO_HTTP_PROXY
 UPSTREAM_BASE = (
     TEAMO_UPSTREAM_BASE if TEAMO_UPSTREAM else
     YUNXIN_UPSTREAM_BASE if VENDOR_UPSTREAM else LEGACY_UPSTREAM_BASE
