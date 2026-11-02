@@ -270,8 +270,13 @@ UPSTREAM_READ_TIMEOUT = 300.0
 # 写超时按「单次 send」计，而 httpx 对 bytes body 只发一次，等于整包上传的预算。
 # 19MB 的 agent 上下文在 320KB/s 上行下要 60s，旧的 60s 正好卡在阈值上。
 UPSTREAM_WRITE_TIMEOUT = float(os.environ.get("UPSTREAM_WRITE_TIMEOUT") or 300.0)
-UPSTREAM_POOL_TIMEOUT = 15.0
+# 池满时快速失败：宁可让客户端立刻重试，也不要把请求挂在 pending 里 15 秒。
+UPSTREAM_POOL_TIMEOUT = float(os.environ.get("UPSTREAM_POOL_TIMEOUT") or 5.0)
 UPSTREAM_CLOSE_TIMEOUT = 5.0
+# 502/4xx 的错误体只用于日志。供应商网关常回「有响应头、body 不结束」，
+# 若无上限地 aread()，一条连接会按读超时（300s）占住池位，502 一多就把池占满。
+UPSTREAM_ERROR_BODY_TIMEOUT = float(os.environ.get("UPSTREAM_ERROR_BODY_TIMEOUT") or 2.0)
+UPSTREAM_ERROR_BODY_LIMIT = 16 * 1024
 # 客户端断开后，后台补读上游只为拿 usage。断连风暴时上游可能迟迟不结束，
 # 必须封顶，否则这些「已无客户端」的请求会一直占着连接池。
 UPSTREAM_DRAIN_TIMEOUT = float(os.environ.get("UPSTREAM_DRAIN_TIMEOUT") or 60.0)
@@ -360,6 +365,33 @@ async def release_upstream_stream(stream_cm, resp, *, timeout: float = UPSTREAM_
             process_log.warning("upstream stream close timed out, forced socket close")
 
 
+async def read_error_body(
+    resp: httpx.Response,
+    *,
+    timeout: float = UPSTREAM_ERROR_BODY_TIMEOUT,
+    limit: int = UPSTREAM_ERROR_BODY_LIMIT,
+) -> bytes:
+    """限时读取错误响应体，只用于日志。
+
+    502/4xx 多为网关直接返回。有的网关只发响应头、body 不结束，
+    此时无限期 aread() 会让这条连接按读超时占住连接池。这里超过 timeout
+    就放弃并取消读取任务，交由 release 路径关掉底层连接。
+    """
+    reader = asyncio.ensure_future(resp.aread())
+    try:
+        raw = await asyncio.wait_for(asyncio.shield(reader), timeout)
+    except asyncio.TimeoutError:
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        process_log.warning("upstream error body read timed out after %ss", timeout)
+        return b""
+    except BaseException:
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        raise
+    return (raw or b"")[:limit]
+
+
 async def _request_upstream_with_retry(
     client: httpx.AsyncClient,
     *, 
@@ -388,6 +420,9 @@ async def _request_upstream_with_retry(
                 len(content or b""),
                 format_upstream_exc(exc),
             )
+            # 池满时重试只会继续排队等连接，不会变快；直接交给调用方快速失败。
+            if isinstance(exc, httpx.PoolTimeout):
+                raise
             large_write_timeout = (
                 isinstance(exc, httpx.WriteTimeout)
                 and len(content or b"") >= UPSTREAM_LARGE_BODY_BYTES
@@ -416,6 +451,11 @@ async def _request_upstream_with_retry(
             UPSTREAM_RETRY_SLEEP,
         )
         if attempt < UPSTREAM_RETRY_ATTEMPTS:
+            # 重试前先关掉这次 502：body 已读完，但连接要 close 才回池。
+            try:
+                await last_resp.aclose()
+            except Exception:
+                pass
             await asyncio.sleep(UPSTREAM_RETRY_SLEEP)
 
     assert last_resp is not None
@@ -2150,7 +2190,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                 resp.status_code in UPSTREAM_RETRY_STATUSES
                                 and attempt < UPSTREAM_RETRY_ATTEMPTS
                             ):
-                                err_body = await resp.aread()
+                                err_body = await read_error_body(resp)
                                 process_log.warning(
                                     "upstream retryable status req=%s status=%s attempt=%s/%s sleep=%ss body=%s",
                                     req_id,
@@ -2172,7 +2212,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                 # 上游非 2xx：按客户端协议吐错误，避免 Claude Code 收到空流
                                 if resp.status_code >= 400:
                                     await finish_request_usage(req_id, resp.status_code)
-                                    err_body = await resp.aread()
+                                    err_body = await read_error_body(resp)
                                     err_text = (err_body or b"").decode(errors="ignore")
                                     process_log.warning(
                                         "upstream error body req=%s status=%s body=%s",
