@@ -793,6 +793,135 @@ def responses_events_to_response(events: list[dict]) -> tuple[Optional[dict], st
     return None, ""
 
 
+def _json_dict_or(raw: str, fallback) -> dict:
+    """把 tool_use 的 partial_json 拼完再解析；解析不出来就保留已有输入。"""
+    if not raw:
+        return fallback if isinstance(fallback, dict) else {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return fallback if isinstance(fallback, dict) else {}
+    if isinstance(parsed, dict):
+        return parsed
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def anthropic_events_to_message(
+    events: list[dict], *, fallback_model: str = ""
+) -> tuple[Optional[dict], str]:
+    """把 Anthropic Messages SSE 事件还原成非流式 message 对象。
+
+    返回 (None, "") 表示这些事件不足以还原一次完整应答（例如上游其实回了普通
+    JSON，或流在 message_stop 之前被截断），由调用方回退处理；第二个返回值非空
+    表示上游在流里直接报告了失败。
+    """
+    message: Optional[dict] = None
+    blocks: dict[int, dict] = {}
+    text_delta: dict[int, list[str]] = {}
+    thinking_delta: dict[int, list[str]] = {}
+    json_delta: dict[int, list[str]] = {}
+    signature: dict[int, list[str]] = {}
+    stop_reason = None
+    stop_sequence = None
+    usage: dict = {}
+    saw_terminator = False
+
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        typ = event.get("type") or ""
+        if typ == "error" or (not typ and isinstance(event.get("error"), dict)):
+            err = event.get("error") if isinstance(event.get("error"), dict) else {}
+            return None, str(err.get("message") or err.get("type") or "upstream error")
+        if typ == "message_start":
+            start = event.get("message")
+            if isinstance(start, dict):
+                message = dict(start)
+                if isinstance(message.get("usage"), dict):
+                    usage.update(message["usage"])
+            continue
+        if typ == "content_block_start":
+            block = event.get("content_block")
+            if isinstance(block, dict):
+                blocks[int(event.get("index") or 0)] = dict(block)
+            continue
+        if typ == "content_block_delta":
+            index = int(event.get("index") or 0)
+            delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+            kind = delta.get("type")
+            if kind == "text_delta":
+                text_delta.setdefault(index, []).append(str(delta.get("text") or ""))
+            elif kind == "thinking_delta":
+                thinking_delta.setdefault(index, []).append(str(delta.get("thinking") or ""))
+            elif kind == "signature_delta":
+                signature.setdefault(index, []).append(str(delta.get("signature") or ""))
+            elif kind == "input_json_delta":
+                json_delta.setdefault(index, []).append(str(delta.get("partial_json") or ""))
+            continue
+        if typ == "message_delta":
+            delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+            if delta.get("stop_reason"):
+                stop_reason = delta["stop_reason"]
+                saw_terminator = True
+            if "stop_sequence" in delta:
+                stop_sequence = delta.get("stop_sequence")
+            if isinstance(event.get("usage"), dict):
+                usage.update(event["usage"])
+            continue
+        if typ == "message_stop":
+            saw_terminator = True
+            continue
+
+    if message is None and not blocks:
+        return None, ""
+
+    content: list[dict] = []
+    for index in sorted(blocks):
+        block = blocks[index]
+        block_type = block.get("type")
+        if block_type == "text":
+            block["text"] = str(block.get("text") or "") + "".join(text_delta.pop(index, []))
+        elif block_type == "thinking":
+            block["thinking"] = str(block.get("thinking") or "") + "".join(
+                thinking_delta.pop(index, [])
+            )
+            sig = "".join(signature.pop(index, []))
+            if sig:
+                block["signature"] = sig
+        elif block_type in {"tool_use", "server_tool_use", "mcp_tool_use"}:
+            block["input"] = _json_dict_or(
+                "".join(json_delta.pop(index, [])), block.get("input")
+            )
+        content.append(block)
+    # 少数上游会省掉 content_block_start 直接发 delta，别把正文丢掉。
+    for index in sorted(set(text_delta) | set(thinking_delta)):
+        text = "".join(text_delta.pop(index, []))
+        thinking = "".join(thinking_delta.pop(index, []))
+        if text:
+            content.append({"type": "text", "text": text})
+        if thinking:
+            content.append({"type": "thinking", "thinking": thinking,
+                            "signature": "".join(signature.pop(index, []))})
+
+    if not saw_terminator:
+        # 流在 message_stop / stop_reason 之前就结束了：不完整，交给调用方回退或报错。
+        return None, ""
+
+    out = dict(message or {})
+    out["type"] = "message"
+    out.setdefault("role", "assistant")
+    if not out.get("model"):
+        out["model"] = fallback_model
+    out["content"] = content
+    out["stop_reason"] = stop_reason or out.get("stop_reason") or "end_turn"
+    out["stop_sequence"] = stop_sequence
+    if usage:
+        merged = dict(out.get("usage") or {})
+        merged.update(usage)
+        out["usage"] = merged
+    return out, ""
+
+
 def non_stream_chunk_to_completion(
     chunks: list[dict], *, fallback_model: str = ""
 ) -> Optional[dict]:
@@ -1673,6 +1802,29 @@ async def log_and_forward_requests(request: Request, call_next):
         headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
         process_log.info(
             "fake non-stream req=%s vendor=%s model=%s source=responses",
+            req_id, runtime_vendor, model,
+        )
+    elif (
+        not want_stream
+        and not count_tokens_route
+        and not anthropic_bridge
+        and not responses_bridge
+        and not protocol_adapt
+        and source == "anthropic"
+        and needs_fake_non_stream(runtime_vendor)
+        and upstream_path.rstrip("/") == "/v1/messages"
+        and not is_image_path(request.url.path)
+        and not is_gemini_native_path(request.url.path)
+    ):
+        # Anthropic 直通也要兜这一层：部分供应商（tongtong）会对 /v1/messages
+        # 的非流式请求直接 400。改发 stream=true，读完整条 SSE 再拼回 message。
+        parsed_body = dict(parsed_body)
+        parsed_body["stream"] = True
+        fake_non_stream = True
+        pending_body_rewrite = True
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+        process_log.info(
+            "fake non-stream req=%s vendor=%s model=%s source=anthropic",
             req_id, runtime_vendor, model,
         )
     if pending_body_rewrite:
@@ -2707,10 +2859,30 @@ async def log_and_forward_requests(request: Request, call_next):
                     parsed_resp = response_obj
                 else:
                     # 没有终止事件：上游可能没按流式回（仍是普通 JSON），也可能流被截断。
-                    parsed_resp = _parse_json_body(resp.content)
+                    # 注意这里不能用 resp.content：流式响应没读过时访问它会抛
+                    # ResponseNotRead，fake_raw 才是已读完的上游原始字节。
+                    parsed_resp = _parse_json_body(fake_raw)
                     if not parsed_resp and fake_chunks:
                         fake_error_message = (
                             "upstream stream ended before response.completed"
+                        )
+            elif source == "anthropic":
+                message_obj, failed_message = anthropic_events_to_message(
+                    fake_chunks, fallback_model=model if model != "-" else ""
+                )
+                if failed_message:
+                    fake_error_message = failed_message
+                    parsed_resp = {}
+                elif message_obj:
+                    parsed_resp = message_obj
+                else:
+                    # 同 responses：上游可能忽略 stream=true 仍回普通 JSON，
+                    # 也可能流在 message_stop 之前被截断。resp.content 在流式响应上
+                    # 未读取时不可访问，这里同样看 fake_raw。
+                    parsed_resp = _parse_json_body(fake_raw)
+                    if not parsed_resp and fake_chunks:
+                        fake_error_message = (
+                            "upstream stream ended before message_stop"
                         )
             else:
                 parsed_resp = non_stream_chunk_to_completion(
