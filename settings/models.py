@@ -196,6 +196,8 @@ class UpstreamVendor(Base):
     api_key = Column(String(512), nullable=True)  # 转发到该号商时使用的上游密钥
     # 转发到该号商时是否走 TEAMO_HTTP_PROXY（区域封锁/需要固定出口的号商打开）
     use_proxy = Column(Boolean, nullable=False, default=False, server_default="0")
+    # Gemini 模型是否改走原生 /v1beta/models/{model}:generateContent（如 xcmapi 只认这个口）
+    gemini_native = Column(Boolean, nullable=False, default=False, server_default="0")
     # 存量 api_key 是否已迁到 tb_upstream_vendor_key；迁过就不再自动重建，避免删掉后被重新插入
     key_migration_done = Column(Boolean, nullable=False, default=False, server_default="0")
     pricing_url = Column(String(512), nullable=True)
@@ -243,10 +245,13 @@ class ModelRoute(Base):
     user_ids 为空表示全部用户；非空时只有这些用户改走该厂商，计价也用该厂商价目。
     api_key_id 指向 tb_upstream_vendor_key，选择该 vendor 下的某把命名 Key。
     分组规则（group_name 非空）一次写入多条 model，同组共用同一 vendor / Key / 用户名单。
+
+    model 允许重名：同一个模型可以按用户拆成多条规则指向不同供应商。匹配时
+    「指定用户」的规则盖过「全部用户」的规则，同层再比模型精确度，最后 id 大的优先。
     """
     __tablename__ = "tb_model_route"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    model = Column(String(255), nullable=False, unique=True, index=True)
+    model = Column(String(255), nullable=False, index=True)
     group_name = Column(String(128), nullable=False, default="", index=True)  # 空=单模型规则
     vendor_code = Column(String(64), nullable=False, index=True)
     api_key = Column(String(512), nullable=True)  # 命中该模型时覆盖供应商密钥；空则沿用供应商
@@ -410,14 +415,19 @@ class VendorModelPrice(Base):
 
 
 class UserModelPrice(Base):
-    """特定用户的专属模型价（USD / 1M tokens，按张计费模型用 per_image_tiers）。
+    """一组用户的专属模型价（USD / 1M tokens，按张计费模型用 per_image_tiers）。
 
-    命中后该价格就是用户应付价：人民币扣费只再乘汇率，不再叠加上游倍率、
-    用户倍率或折扣。model 支持精确名、- 边界前缀和 gemini* 这类开头通配。
+    一行可绑定多个用户（user_ids），同组用户共用同一套价格；命中后该价格
+    就是用户应付价：人民币扣费只再乘汇率，不再叠加上游倍率、用户倍率或折扣。
+    model 支持精确名、- 边界前缀和 gemini* 这类开头通配。
+
+    user_id 保留为「首个用户」，兼容旧接口与旧数据；计费匹配一律以 user_ids 为准。
     """
     __tablename__ = "tb_user_model_price"
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("tb_user.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 该价格适用的全部用户主键；旧数据为空时按 user_id 单用户处理
+    user_ids = Column(JSON, nullable=True)
     model = Column(String(255), nullable=False, index=True)
     service_tier = Column(String(32), nullable=False, default="standard")
     input_price = Column(Float, nullable=False, default=0)
@@ -432,8 +442,10 @@ class UserModelPrice(Base):
     note = Column(String(200), nullable=False, default="")
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    # 不再有 (user_id, model, service_tier) 唯一约束：同一条价格覆盖多用户后，
+    # 单个用户可能同时出现在多行里（不同分组），由匹配逻辑按精确度择优。
     __table_args__ = (
-        UniqueConstraint("user_id", "model", "service_tier", name="uq_user_model_price"),
+        Index("ix_user_model_price_model", "model"),
     )
 
 

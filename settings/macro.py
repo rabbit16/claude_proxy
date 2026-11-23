@@ -95,6 +95,22 @@ HEADROOM_KOMPRESS = os.environ.get("HEADROOM_KOMPRESS", "0").strip().lower() in 
 }
 HEADROOM_MIN_TOKENS = int(os.environ.get("HEADROOM_MIN_TOKENS", "250"))
 
+# 历史图片转文字。默认关闭：开启后，若模型在上一轮的回复里留下了图片笔记
+# （<image_memo>…</image_memo> 或 <!-- image_memo: … -->），代理会把历史轮次的
+# 图片块替换成这段笔记，避免每轮重复上传几 MB 的 base64。
+# 只动最后一个 user 消息之前的历史；图片笔记来自客户端回传的 assistant 原文，
+# 因此同一段历史每轮算出的字节完全相同，前缀缓存最多错一次。
+IMAGE_MEMO_ENABLED = os.environ.get("IMAGE_MEMO_ENABLED", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+# 笔记正文最大字符数，防止上游写出超长笔记把上下文顶满。
+IMAGE_MEMO_MAX_CHARS = int(os.environ.get("IMAGE_MEMO_MAX_CHARS", "4000"))
+# 命中的历史带图消息数达到该值才做替换，便于灰度时先只处理图片多的会话。
+IMAGE_MEMO_MIN_IMAGES = int(os.environ.get("IMAGE_MEMO_MIN_IMAGES", "1"))
+
 ONLINE = 0
 POOL_RECYCLE_TIME = 3600
 from settings.capacity import CAPACITY
@@ -233,6 +249,11 @@ MODEL_MAP_MONEY_DICT = {
     "gpt-6.1-sol": _p(2.00, 10.00, 0.10, 2.50),
     # https://developers.openai.com/api/docs/models/gpt-6.1-terra
     "gpt-6.1-terra": _p(1.00, 5.00, 0.05, 1.25),
+    # GPT-6.2 官方缓存读均为输入的 5%
+    # https://developers.openai.com/api/docs/models/gpt-6.2-astra
+    "gpt-6.2-astra": _p(8.00, 40.00, 0.40, 10.00),
+    # https://developers.openai.com/api/docs/models/gpt-6.2-sol
+    "gpt-6.2-sol": _p(2.00, 10.00, 0.10, 2.50),
     "gpt-6-luna": _p(0.10, 0.50, 0.01, 0.125),
     "gpt-6": _p(10.00, 50.00, 1.00, 12.50),  # 默认对齐 Astra
 
@@ -376,12 +397,56 @@ OFFICIAL_PROVIDER_MODEL_MONEY_DICT = {
     "glm-5.3": _cny(8, 28, 2),
     "glm-5.3-flash": _cny(0.8, 2.8, 0.23),
     "glm-5.2": _cny(8, 28, 2),
+    # 2026-11 新发布模型（标准价取自各官网 list price）
+    # https://platform.claude.com/docs/en/about-claude/pricing
+    "claude-fable-5-2": _p(8.00, 40.00, 0.20, 10.00),
+    # https://ai.google.dev/gemini-api/docs/pricing
+    "gemini-4-carbon": _p(2.00, 10.00, 0.10),
+    "gemini-4-argon": _p(2.00, 10.00, 0.10),
+    "gemini-4-hydrogen": _p(1.50, 7.50, 0.075),
+    "gemini-3.1-flash-lite-preview": _p(0.25, 1.50, 0.025),
+    # https://api-docs.deepseek.com/quick_start/pricing
+    "deepseek-flash-1017": _p(0.15, 0.60, 0.003),
+    "deepseek-v4-pro-260425": _p(1.74, 3.48, 0.145),
+    "deepseek-flash-free": _p(0.15, 0.60, 0.003),
+    "deepseek-v4-flash-free": _p(0.44, 1.32, 0.014),
+    # https://docs.bigmodel.cn/cn/guide/start/pricing
+    "glm-5.3-flash-free": _p(0.114, 0.40, 0.03),
+    # 通义 / 豆包 / Kimi / MiniMax / MiMo 官方标准价
+    "qwen4-max": _p(1.413, 4.24, 0.071, 1.767),
+    "qwen3.8-max": _p(1.7143, 5.1429, 0.2143, 2.1429),
+    "qwen3.8-flash": _p(0.1143, 0.3857, 0.0143, 0.1786),
+    "qwen3.7-max": _p(1.7143, 5.1429, 0.3429, 2.1429),
+    "qwen3.7-flash": _p(0.0286, 0.1143, 0.0057, 0.0357),
+    "doubao-seed-2.1-pro": _p(0.8571, 4.2857, 0.1714),
+    "doubao-seed-2.1-lite": _p(0.1143, 0.3857, 0.0229),
+    "doubao-seed-2.0-lite": _p(0.0857, 0.5143, 0.0171),
+    "kimi-k3.1-pro": _p(2.00, 10.00, 0.20, 2.00),
+    "kimi-k3": _p(3.00, 15.00, 0.30),
+    "minimax-m3.1-flash": _p(0.15, 0.60, 0.015),
+    "MiniMax-M3": _p(0.30, 1.20, 0.06),
+    "mimo-v2.6-pro": _p(0.4286, 0.8571, 0.0036),
+    "mimo-v2.6-flash": _p(0.1429, 0.2857, 0.0029),
+    "jev-1.14.0": _p(0.042, 0.0),
+    "jev-1.13.0": _p(0.042, 0.0),
 }
 
 # https://ai.google.dev/gemini-api/docs/pricing  Gemini 3.1 Flash Image Standard
 # 图像输出 $60 / 1M tokens；文本输出 $3，图像模型的 output 按图像 token 计。
 OFFICIAL_PROVIDER_IMAGE_MODEL_MONEY_DICT = {
     "gemini-3.1-flash-image": _img(0.50, 0.50, 60.00),
+    # Gemini 3 Pro Image / Nano Banana 2.1：输入 $2 / 图像输出 $120（每 1M tokens）
+    "gemini-3-pro-image": _img(2.00, 2.00, 120.00),
+    "gemini-nano-banana-2.1": _img(1.50, 1.50, 30.00),
+    # Midjourney MJ 按张计费，$0.8/张（1k 档）
+    "mj_imagine": {
+        "kind": "image",
+        "billing": "per_image",
+        "per_image_tiers": {"1k": 0.80},
+        "text_input": 0.0,
+        "image_input": 0.0,
+        "output": 0.0,
+    },
 }
 
 
@@ -391,6 +456,8 @@ OFFICIAL_PROVIDER_IMAGE_MODEL_MONEY_DICT = {
 IMAGE_MODEL_MONEY_DICT = {
     "gpt-image-2.5-sunburst": _img(5.00, 8.00, 30.00, 1.25, 2.00),
     "gpt-image-2.5-flare": _img(5.00, 8.00, 30.00, 1.25, 2.00),
+    "gpt-image-2.6-sunburst": _img(5.00, 8.00, 30.00, 1.25, 2.00),
+    "gpt-image-2.6-flare": _img(5.00, 8.00, 30.00, 1.25, 2.00),
     "gpt-image-2": _img(2.50, 4.00, 15.00, 0.625, 1.00),
     "gpt-image-1.5": _img(5.00, 8.00, 32.00, 1.25, 2.00),
     "chatgpt-image-latest": _img(5.00, 8.00, 32.00, 1.25, 2.00),
@@ -427,6 +494,14 @@ TEAMO_IMAGE_MODEL_MONEY_DICT = {
         text_in=0.5, image_in=0.8, image_out=3.0, text_cache=0.125,
     ),
     "gpt-image-2.5-flare": _img_per_call(
+        {"1k": 0.006, "2k": 0.02, "4k": 0.025},
+        text_in=0.5, image_in=0.8, image_out=3.0, text_cache=0.125,
+    ),
+    "gpt-image-2.6-sunburst": _img_per_call(
+        {"1k": 0.006, "2k": 0.02, "4k": 0.025},
+        text_in=0.5, image_in=0.8, image_out=3.0, text_cache=0.125,
+    ),
+    "gpt-image-2.6-flare": _img_per_call(
         {"1k": 0.006, "2k": 0.02, "4k": 0.025},
         text_in=0.5, image_in=0.8, image_out=3.0, text_cache=0.125,
     ),

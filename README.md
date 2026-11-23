@@ -87,6 +87,9 @@ chmod 600 .env
 | `TEAMO_HTTP_PROXY` | 空 | 直连受阻时填本机代理，如 `http://127.0.0.1:7890` |
 | `TEAMO_API_KEY_FILE` | `/etc/claude_code_proxy/teamo_api_key` | 密钥文件（需 `chmod 600`），`TEAMO_API_KEY` 为空时兜底 |
 | `HEADROOM_ENABLED` | `0` | 是否启用请求压缩 |
+| `IMAGE_MEMO_ENABLED` | `0` | 是否把历史轮次的图片替换成模型写的图片笔记 |
+| `IMAGE_MEMO_MAX_CHARS` | `4000` | 笔记正文最大字符数，超出截断 |
+| `IMAGE_MEMO_MIN_IMAGES` | `1` | 命中的历史带图消息数达到该值才替换（灰度用） |
 | `LEGACY_UPSTREAM_BASE` | `http://127.0.0.1:4001` | `legacy` 模式的 LiteLLM 地址 |
 
 > 项目**未使用 python-dotenv**，代码不会自动读取 `.env`。生效方式：
@@ -156,12 +159,44 @@ curl http://127.0.0.1:4000/v1/messages \
   → 应用模型改写
   → 解析运行时上游（按用户/模型路由规则，未命中回落全局默认）
   → 价格校验（未公布价格的模型直接 400）
-  → 可选压缩 → 提示注入 → 上游模型名映射（如号商的 -hc 后缀）
+  → 可选压缩 → 提示注入 → 历史图片转文字（IMAGE_MEMO_ENABLED）
+  → 上游模型名映射（如号商的 -hc 后缀）
   → 上游请求清洗（如 max_tokens / stream_options 归一）
   → 协议桥接（按需）
   → 注入上游密钥并转发
   → 流式收集用量 → 计费落库
 ```
+
+### 历史图片转文字（image memo）
+
+同一对话里反复上传图片时，客户端每轮都会把历史图片的 base64 一起回传，
+代理发往上游的报文越来越大，首字越来越慢、图像 token 也越来越贵。
+
+**机制**（`utils/image_memo.py`）：
+
+1. 在后台 `tb_prompt_injection` 加一条 `scope=all`、`position=append` 的注入，
+   要求模型看图后先输出一段笔记，再正常回答：
+
+   ```
+   【图片笔记规则】当本轮用户消息包含图片时，先输出一段图片笔记，格式严格为：
+   <image_memo>该图片可脱离原图理解的完整文字描述：图中所有可见文字原文、界面/报表/图表的字段与数值、布局与关键视觉细节。不要省略文字内容，不要只写一句话概括。</image_memo>
+   随后再正常回答。
+   当你看到 <image_memo> 或 <!-- image_memo: ... --> 时，说明原图已省略，直接使用笔记信息，不要再要求用户重新上传。
+   （可在此处补上你们统一 skill 说明的链接。）
+   ```
+
+2. 下一轮客户端把 assistant 原文回传后，代理在 **最后一个 user 消息之前**的历史里
+   找到该图片对应的笔记，把图片块合并替换成一个 text 块；
+   **当前轮新上传的图片保持原样**，不牺牲当轮识图质量。
+3. 没有笔记的消息一律不动（宁可不省也不降质量）。
+
+**前缀缓存**：替换正文取自客户端回传的历史原文，是内容的纯函数，
+所以同一段对话每轮算出的字节完全相同；只有首次替换那一轮前缀会错一次，
+之后恢复命中。笔记格式同时支持 `<image_memo>…</image_memo>` 和
+`<!-- image_memo: … -->`（后者在 Web 端 Markdown 渲染时不可见）。
+
+**边界**：Gemini 原生入口、`/v1/images/*`、`/v1/audio/*`、`count_tokens`
+以及 `previous_response_id` 的服务端历史都不处理。
 
 ## 接口
 
@@ -190,6 +225,19 @@ Gemini 原生入口：
 - 上游不支持 `alt=sse`、回 JSON 数组时，流式请求会自动把分片逐条转成 `data:` 事件。
 - 当前只放开生图模型（如 `gemini-3.1-flash-image`）：没有生图价目的 Gemini 文本模型返回 400，
   避免用图片价目误计费。
+
+供应商 `gemini_native` 开关：
+
+- 部分号商（如 xcmapi）只在 `/v1beta/models/{model}:*` 上提供 Gemini，`/v1/chat/completions`
+  与 `/v1/responses` 对该分组直接 404 / 503。给供应商打开 `gemini_native` 后，OpenAI Chat、
+  Responses、Anthropic Messages 与 Images 入口的 `gemini*` 模型会在转发前转成 Gemini 原生
+  请求体，响应（含流式）再转回客户端协议；其它模型和其它供应商完全不受影响。
+- 只对 Gemini 模型生效，模型名仍按路由/改写后的值下发。
+- 转发 `/v1beta` 时**不补 `alt=sse`**：xcmapi 带该参数会 502，不带时 `:streamGenerateContent`
+  直接回 SSE。
+- 生图模型在 chat / responses / messages 入口按图片计费，返回结果放在各自的 content parts 里；
+  `/v1/images/*` 入口返回 `b64_json`。
+- 计费仍用客户端原始请求体（模型名、价目档位不因转换而变）。
 
 ### 查询与管理接口
 
@@ -261,6 +309,8 @@ GET  /v1/admin/runtime                # 当前运行时上游
 | `tb_agent_task` | 归并后的代理任务 |
 
 规则类表（route / alias / rewrite / protocol / injection）在进程内维护内存缓存，管理接口写入后立即重载。
+
+`tb_model_route.model` 允许重名：同一个模型可以按用户拆成多条规则指向不同供应商。命中优先级为「模型精确度 → 用户范围 → id」，即精确/更长前缀优先，其次指定了该用户的规则优先于「全部用户」规则（指定用户里名单更短的再优先），最后后建的规则胜出。旧库启动时会自动把 `model` 上的唯一索引改成普通索引。
 
 ## 计费说明
 

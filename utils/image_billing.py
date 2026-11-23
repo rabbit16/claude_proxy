@@ -1,4 +1,5 @@
 import base64
+import os
 import re
 import struct
 from typing import Any, Dict, Optional, Tuple
@@ -19,6 +20,77 @@ from utils.user_price import match_user_price
 from utils.request_usage import apply_billed_usage
 from utils.task_guard import finish_writes
 from utils.get_log import billing_log
+
+
+# 号商统一价：命中后每张固定扣该金额（人民币），不看用户倍率/折扣/档位。
+# 格式 `vendor_code:模型前缀[:每张元数]`，逗号分隔多条，前缀可用 | 并列多个。
+# 例：jichumo:gpt-image|chatgpt-image:0.1 → jichumo 下这两类模型统一 0.1 元/张。
+IMAGE_FLAT_PRICE_RULES = [
+    item.strip()
+    for item in (
+        os.environ.get("IMAGE_FLAT_PRICE_RULES")
+        or "jichumo:gpt-image|chatgpt-image:0.1"
+    ).split(",")
+    if item.strip()
+]
+
+
+def _flat_image_price(model: str, vendor: str) -> Optional[float]:
+    """命中统一价规则时返回每张人民币价，否则 None。"""
+    vendor = (vendor or "").strip().lower()
+    name = normalize_model_name(model) or ""
+    for rule in IMAGE_FLAT_PRICE_RULES:
+        parts = rule.split(":")
+        if len(parts) != 3:
+            continue
+        rule_vendor, prefix, amount = (part.strip() for part in parts)
+        if vendor != rule_vendor.lower():
+            continue
+        # 前缀支持用 | 并列多个：jichumo:gpt-image|chatgpt-image:0.1
+        prefixes = [item.strip().lower() for item in prefix.split("|") if item.strip()]
+        if not any(name.startswith(item) for item in prefixes):
+            continue
+        try:
+            price = float(amount)
+        except ValueError:
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def _flat_image_summary(
+    *, per_image_cny: float, n: int, usd_cny_rate: float,
+    text_tokens: int, image_input_tokens: int, output_tokens: int,
+    size_tier: str,
+) -> dict:
+    """把「每张固定价」拼成与 calc_image_charge 兼容的结果，倍率/折扣恒为 1。"""
+    usd_cny_rate = float(usd_cny_rate or DOR2CHY) or DOR2CHY
+    charged = per_image_cny * n
+    usd_cost = charged / usd_cny_rate
+    return {
+        "kind": "image",
+        "billing": "per_image",
+        "size_tier": size_tier or "1k",
+        "per_image_price": per_image_cny / usd_cny_rate,
+        "text_tokens": text_tokens,
+        "image_input_tokens": image_input_tokens,
+        "output_tokens": output_tokens,
+        "input_tokens": text_tokens + image_input_tokens,
+        "n": n,
+        "text_price": 0.0,
+        "image_input_price": 0.0,
+        "output_price": 0.0,
+        "usd_cost": usd_cost,
+        "cost_cny": usd_cost * usd_cny_rate,
+        "charged": charged,
+        "profit": 0.0,
+        "multiplier": 1.0,
+        "usd_cny_rate": usd_cny_rate,
+        "cost_usd_cny_rate": usd_cny_rate,
+        "cache_read_multiplier": CACHE_READ_MULTIPLIER,
+        "flat_price_cny": per_image_cny,
+    }
 
 
 def lookup_price_in(table: dict, model: str):
@@ -443,8 +515,13 @@ async def compute_image_charge(
     body = body or {}
     usage = usage or {}
     model = body.get("model") or usage.get("model") or DEFAULT_IMAGE_MODEL
+    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
+    # 先于价目查询命中，模型不在价目表里也能按专属价扣。
+    user_price = match_user_price(model, user_key=user_id)
+    # 号商统一价优先级最高：命中即每张固定金额，忽略专属价、倍率、折扣与档位。
+    flat_price = _flat_image_price(model, vendor)
     prices = lookup_image_price(model, teamo=use_teamo_prices, vendor=vendor)
-    if not prices:
+    if not prices and not user_price and flat_price is None:
         billing_log.warning(
             "skip req=%s user=%s source=%s model=%s reason=unknown_image_price",
             req_id,
@@ -464,8 +541,6 @@ async def compute_image_charge(
                 request_size = image_cfg.get("imageSize") or image_cfg.get("image_size")
     from utils.pricing import get_pricing_config
     from utils.vendor_catalog import vendor_cost_usd_cny_rate, vendor_profit_multiplier
-    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
-    user_price = match_user_price(model, user_key=user_id)
     if user_price:
         tiers = user_price.get("per_image_tiers")
         prices = {
@@ -483,24 +558,36 @@ async def compute_image_charge(
         nonlocal summary
         async with AsyncSessionLocal() as db:
             pricing_config = await get_pricing_config(db)
-            profit_multiplier = 1.0 if user_price else vendor_profit_multiplier(
-                vendor, pricing_config.profit_multiplier,
-            )
-            cost_rate = vendor_cost_usd_cny_rate(vendor, pricing_config.usd_cny_rate)
-            summary = calc_image_charge(
-                text_tokens=usage.get("text_tokens") or 0,
-                image_input_tokens=usage.get("image_input_tokens") or 0,
-                output_tokens=usage.get("output_tokens") or 0,
-                n=n,
-                prices=prices,
-                profit_multiplier=profit_multiplier,
-                usd_cny_rate=pricing_config.usd_cny_rate,
-                cost_usd_cny_rate=cost_rate,
-                size_tier=usage.get("size_tier") or "",
-                width=usage.get("width"),
-                height=usage.get("height"),
-                request_size=request_size,
-            )
+            if flat_price is not None:
+                # 统一价：每张固定人民币价，不走倍率/折扣/成本换算。
+                summary = _flat_image_summary(
+                    per_image_cny=flat_price,
+                    n=n,
+                    usd_cny_rate=pricing_config.usd_cny_rate,
+                    text_tokens=usage.get("text_tokens") or 0,
+                    image_input_tokens=usage.get("image_input_tokens") or 0,
+                    output_tokens=usage.get("output_tokens") or 0,
+                    size_tier=usage.get("size_tier") or "",
+                )
+            else:
+                profit_multiplier = 1.0 if user_price else vendor_profit_multiplier(
+                    vendor, pricing_config.profit_multiplier,
+                )
+                cost_rate = vendor_cost_usd_cny_rate(vendor, pricing_config.usd_cny_rate)
+                summary = calc_image_charge(
+                    text_tokens=usage.get("text_tokens") or 0,
+                    image_input_tokens=usage.get("image_input_tokens") or 0,
+                    output_tokens=usage.get("output_tokens") or 0,
+                    n=n,
+                    prices=prices,
+                    profit_multiplier=profit_multiplier,
+                    usd_cny_rate=pricing_config.usd_cny_rate,
+                    cost_usd_cny_rate=cost_rate,
+                    size_tier=usage.get("size_tier") or "",
+                    width=usage.get("width"),
+                    height=usage.get("height"),
+                    request_size=request_size,
+                )
             if not summary:
                 billing_log.warning(
                     "skip req=%s user=%s source=%s model=%s reason=no_image_usage",
@@ -520,9 +607,10 @@ async def compute_image_charge(
                     model or "-",
                 )
                 return False
-            money_rate = 1.0 if user_price else (user.money_rate or 1)
-            discount = 1.0 if user_price else (user.discount or 1)
-            if user_price or money_rate != 1 or discount != 1:
+            money_rate = 1.0 if (user_price or flat_price is not None) else (user.money_rate or 1)
+            discount = 1.0 if (user_price or flat_price is not None) else (user.discount or 1)
+            # 统一价结果已经终态，不再按倍率/折扣重算。
+            if flat_price is None and (user_price or money_rate != 1 or discount != 1):
                 if user_price:
                     summary["multiplier"] = 1.0
                 summary = calc_image_charge(

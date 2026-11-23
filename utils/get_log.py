@@ -8,14 +8,14 @@ ACCESS_LOG_NAME = "access"
 BILLING_LOG_NAME = "billing"
 BILLING_AUDIT_LOG_NAME = "billing_audit"
 PROCESS_LOG_NAME = "process"
-DEEPSEEK_SLOW_LOG_NAME = "deepseek_slow"
+SLOW_TTFB_LOG_NAME = "slow_ttfb"
 
 access_log = logging.getLogger(ACCESS_LOG_NAME)
 billing_log = logging.getLogger(BILLING_LOG_NAME)
 billing_audit_log = logging.getLogger(BILLING_AUDIT_LOG_NAME)
 process_log = logging.getLogger(PROCESS_LOG_NAME)
-# DeepSeek 上游首字超过阈值的单独留档，便于事后按供应商分析慢请求。
-deepseek_slow_log = logging.getLogger(DEEPSEEK_SLOW_LOG_NAME)
+# 首字超过阈值的请求单独留档，便于拆解耗时归属（上传 / 上游排队 / 上游首包）。
+slow_ttfb_log = logging.getLogger(SLOW_TTFB_LOG_NAME)
 
 log_queue = multiprocessing.Queue()
 listener = None
@@ -56,13 +56,13 @@ def _build_file_handlers():
     billing_handler = _rotating_handler("billing.log")
     billing_audit_handler = _rotating_handler("billing_audit.log")
     process_handler = _rotating_handler("process.log")
-    deepseek_slow_handler = _rotating_handler("deepseek_slow.log")
+    slow_ttfb_handler = _rotating_handler("slow_ttfb.log")
     return {
         ACCESS_LOG_NAME: access_handler,
         BILLING_LOG_NAME: billing_handler,
         BILLING_AUDIT_LOG_NAME: billing_audit_handler,
         PROCESS_LOG_NAME: process_handler,
-        DEEPSEEK_SLOW_LOG_NAME: deepseek_slow_handler,
+        SLOW_TTFB_LOG_NAME: slow_ttfb_handler,
         "system": process_handler,
         "check_user": process_handler,
         "common_util": process_handler,
@@ -81,7 +81,7 @@ def setup_standalone_logging():
         (BILLING_LOG_NAME, handlers[BILLING_LOG_NAME]),
         (BILLING_AUDIT_LOG_NAME, handlers[BILLING_AUDIT_LOG_NAME]),
         (PROCESS_LOG_NAME, handlers[PROCESS_LOG_NAME]),
-        (DEEPSEEK_SLOW_LOG_NAME, handlers[DEEPSEEK_SLOW_LOG_NAME]),
+        (SLOW_TTFB_LOG_NAME, handlers[SLOW_TTFB_LOG_NAME]),
     ):
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)
@@ -115,7 +115,7 @@ def setup_worker_logger():
     root.handlers = [queue_handler]
     for name in (
         ACCESS_LOG_NAME, BILLING_LOG_NAME, BILLING_AUDIT_LOG_NAME, PROCESS_LOG_NAME,
-        DEEPSEEK_SLOW_LOG_NAME, "system", "check_user",
+        SLOW_TTFB_LOG_NAME, "system", "check_user",
     ):
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)

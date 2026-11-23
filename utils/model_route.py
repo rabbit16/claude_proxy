@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from settings.database import AsyncSessionLocal
 from settings.models import ModelRoute, User
@@ -177,6 +177,40 @@ async def reload_routes() -> list[dict]:
     return list(_cache)
 
 
+async def ensure_model_route_indexes(conn) -> None:
+    """放开 tb_model_route.model 的唯一约束，改建成普通索引（幂等）。
+
+    同名路由是特性：同一个模型按用户拆成多条，分别指向不同供应商。老库曾经
+    把 model 建成唯一索引，启动时拆掉；新库建表时已是普通索引，这里只补索引。
+    """
+    rows = (await conn.execute(text(
+        "SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME "
+        "FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tb_model_route' "
+        "ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+    ))).all()
+    columns: dict[str, list[str]] = {}
+    unique: dict[str, bool] = {}
+    for name, non_unique, _seq, column in rows:
+        key = str(name)
+        columns.setdefault(key, []).append(str(column or "").strip().lower())
+        unique[key] = int(non_unique or 0) == 0
+    model_only_unique = {
+        name for name, cols in columns.items() if cols == ["model"] and unique.get(name)
+    }
+    for name in model_only_unique:
+        # 只拆「model 单列」的唯一索引；复合唯一索引不动。
+        await conn.execute(text(f"ALTER TABLE tb_model_route DROP INDEX `{name}`"))
+        process_log.info("dropped unique index on tb_model_route.model name=%s", name)
+    plain_model_index = any(
+        "model" in cols and not unique.get(name)
+        for name, cols in columns.items()
+        if name not in model_only_unique
+    )
+    if not plain_model_index:
+        await conn.execute(text("CREATE INDEX ix_tb_model_route_model ON tb_model_route (model)"))
+
+
 def list_routes(*, active_only: bool = False) -> list[dict]:
     items = [_public_route(item) for item in _cache]
     if active_only:
@@ -250,10 +284,24 @@ def pattern_specificity(pattern: str, model: str) -> Optional[tuple[int, int, in
     return None
 
 
-def match_model_route(model: str, user_id: Optional[int] = None) -> Optional[dict]:
-    """精确 > 最长前缀（- 边界或末尾 *）> 整段 token。
+def _scope_key(item: dict) -> tuple[int, int]:
+    """同名规则的用户优先级：指定用户 > 全体用户；指定用户里名单更短（更精准）的优先。"""
+    ids = item.get("user_id_set")
+    if ids is None:
+        ids = set(normalize_user_ids(item.get("user_ids")))
+    if not ids:
+        return (0, 0)
+    return (1, -len(ids))
 
-    gemini* 命中所有以 gemini 开头的模型。user_id 为空时，只命中「全部用户」规则。
+
+def match_model_route(model: str, user_id: Optional[int] = None) -> Optional[dict]:
+    """优先级：(模型精确度, 用户范围, id)，越大越优先。
+
+    模型精确度沿用原规则：精确 > 最长前缀（- 边界或末尾 *）> 整段 token，
+    所以非重名场景的行为完全不变。模型同分时才比用户范围：指定了该用户的
+    规则压过「全部用户」的规则，名单更短的压过更长的，最后后建（id 大）的胜出。
+    这样同一个模型可以按用户拆成多条，分别指向不同供应商。
+    user_id 为空时只命中「全部用户」规则；gemini* 命中所有以 gemini 开头的模型。
     """
     model = _norm(model)
     if not model:
@@ -263,9 +311,11 @@ def match_model_route(model: str, user_id: Optional[int] = None) -> Optional[dic
     for item in _cache:
         if not item["is_active"] or not item["model"] or not rule_applies_to_user(item, user_id):
             continue
-        score = pattern_specificity(item["model"], model)
-        if score is None:
+        specificity = pattern_specificity(item["model"], model)
+        if specificity is None:
             continue
+        tier, length, literal = specificity
+        score = (tier, length, literal, *_scope_key(item), item.get("id") or 0)
         if best_score is None or score > best_score:
             best = item
             best_score = score
@@ -397,7 +447,10 @@ def overlay_catalog_rows(
     for rule in rules:
         for row in override_catalogs.get(rule["vendor_code"]) or []:
             model = row.get("model") or ""
-            if not match_model_route(model, user_id=user_id):
+            # 同名规则可能指向不同供应商，只有真正命中的那一条才补价目，
+            # 否则落选规则会把同一模型再加一遍。
+            winner = match_model_route(model, user_id=user_id)
+            if not winner or winner["id"] != rule["id"]:
                 continue
             key = (model, row.get("service_tier") or "standard")
             if key in seen:
@@ -442,6 +495,9 @@ async def upsert_route(
 
     分组名相同即视为同一组：改分组时先按「编辑时的旧分组」或 route_id 找旧成员，
     再对齐到本次提交的模型集合，并把整组 vendor / Key / 用户名单同步过去。
+
+    model 允许重名：新建时总是插一条新规则（同一模型可以给不同用户指向不同供应商）；
+    带 route_id 编辑时只改这一条。分组批量编辑按组成员对齐，组内已有同名成员直接复用。
     """
     patterns = normalize_route_models(models, fallback=model)
     vendor_code = (vendor_code or "").strip().lower()
@@ -449,7 +505,8 @@ async def upsert_route(
         raise ValueError(f"unknown vendor: {vendor_code}")
     if api_key_id and not vendor_key_secret(vendor_code, api_key_id):
         raise ValueError(f"unknown vendor key: {api_key_id}")
-    group = (group_name or "").strip()[:128]
+    # None = 本次不动分组（开关这类局部更新）；"" = 显式改成不分组
+    group = None if group_name is None else (group_name or "").strip()[:128]
     ids: list[int] = []
     if user_ids is not None:
         ids = normalize_user_ids(user_ids)
@@ -467,40 +524,47 @@ async def upsert_route(
             if missing:
                 raise ValueError(f"unknown user: {missing[0]}")
         existing = list((await db.execute(select(ModelRoute))).scalars().all())
-        by_model = {row.model: row for row in existing}
         target_row = next((row for row in existing if route_id and row.id == route_id), None)
+        if route_id and target_row is None:
+            raise ValueError(f"route not found: {route_id}")
         # 分组改名：按编辑前那条记录的分组，把旧成员一起带过来
         old_group = (getattr(target_row, "group_name", "") or "").strip() if target_row else ""
+        if group is None:
+            old_members = [target_row] if target_row else []
+        else:
+            old_members = (
+                [row for row in existing if old_group and (row.group_name or "").strip() == old_group]
+                or ([target_row] if target_row else [])
+            )
+        # 组内按模型名对齐要复用的旧行；被编辑的那条永远优先，避免同名时改错行。
+        reusable: dict[str, ModelRoute] = {}
+        for row in ([target_row] if target_row else []) + [
+            item for item in old_members if item is not target_row
+        ]:
+            reusable.setdefault((row.model or "").strip().lower(), row)
 
-        def members_of(name: str) -> list[ModelRoute]:
-            if not name:
-                return []
-            return [row for row in existing if (row.group_name or "").strip() == name]
-
-        old_members = members_of(old_group) if old_group else ([target_row] if target_row else [])
-
-        for pattern in patterns:
-            clash = by_model.get(pattern)
-            if clash is not None and clash not in old_members and clash.id != route_id:
-                raise ValueError(f"model already routed: {pattern}")
-
-        # 本组不再包含的旧成员：拆分出去的放开为独立规则，而不是直接删除
-        kept = set(patterns)
-        for row in old_members:
-            if row.model not in kept:
-                row.group_name = ""
-        if old_group and group and old_group != group:
+        if group is not None:
+            # 本组不再包含的旧成员：拆分出去的放开为独立规则，而不是直接删除
+            kept = set(patterns)
             for row in old_members:
-                row.group_name = group
+                if row.model not in kept:
+                    row.group_name = ""
+            if old_group and group and old_group != group:
+                for row in old_members:
+                    row.group_name = group
 
         saved_ids: list[int] = []
         for pattern in patterns:
-            row = by_model.get(pattern)
+            row = reusable.pop(pattern, None)
+            if row is None and target_row is not None and len(patterns) == 1:
+                # 单条编辑改了模型名：沿用原来那条记录，而不是新插一行。
+                row = target_row
             if row is None:
-                row = ModelRoute(model=pattern)
+                row = ModelRoute(model=pattern, group_name=group or "")
                 db.add(row)
             row.model = pattern
-            row.group_name = group
+            if group is not None:
+                row.group_name = group
             row.vendor_code = vendor_code
             row.is_active = bool(is_active)
             row.note = (note or "")[:200]

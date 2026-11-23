@@ -31,6 +31,7 @@ from utils.openai_responses_bridge import (
     responses_to_chat_completion,
     _reasoning_item_text,
 )
+from utils.gemini_native import GeminiToOpenAIStream
 
 CHAT_PROTOCOLS = ("openai", "anthropic", "responses")
 UPSTREAM_PATHS = {
@@ -832,6 +833,83 @@ class ChatToResponsesStream:
 
     def feed_openai_event(self, obj: Optional[dict]) -> List[bytes]:
         return self.feed_event(obj)
+
+
+class GeminiToClientStream:
+    """Gemini 流式分片 → 客户端协议的 SSE 文本。
+
+    上游是 Gemini 原生 ``data: {"candidates":[...]}``，先统一转成 chat.completion.chunk，
+    再交给目标协议的桥接器。终止事件与 ``[DONE]`` 在这里一并补上，
+    保证调用方按普通 SSE 结束逻辑处理即可。
+    """
+
+    def __init__(self, client: str, client_model: str = ""):
+        self.client = client
+        self.client_model = client_model
+        self.usage: Optional[dict] = None
+        self._gem = GeminiToOpenAIStream(client_model)
+        self._oai_to_anth = (
+            OpenAIToAnthropicStream(client_model=client_model) if client == "anthropic" else None
+        )
+        self._chat_to_resp = ChatToResponsesStream(client_model) if client == "responses" else None
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def max_block_index(self) -> int:
+        return max(
+            self._oai_to_anth.max_block_index if self._oai_to_anth else -1,
+            self._chat_to_resp.max_block_index if self._chat_to_resp else -1,
+        )
+
+    def _emit_openai(self, obj: dict) -> List[str]:
+        if self.client == "openai":
+            return [_sse_data(obj).decode("utf-8")]
+        if self._oai_to_anth is not None:
+            return [chunk.decode("utf-8") for chunk in self._oai_to_anth.feed_openai_event(obj)]
+        if self._chat_to_resp is not None:
+            return [chunk.decode("utf-8") for chunk in self._chat_to_resp.feed_openai_event(obj)]
+        return []
+
+    def _finish_client(self) -> List[str]:
+        if self.client == "openai":
+            return ["data: [DONE]\n\n"]
+        if self._oai_to_anth is not None:
+            return [chunk.decode("utf-8") for chunk in self._oai_to_anth.finish()]
+        if self._chat_to_resp is not None:
+            return [chunk.decode("utf-8") for chunk in self._chat_to_resp.finish()]
+        return []
+
+    def feed(self, obj: Optional[dict]) -> List[str]:
+        if self._closed or not isinstance(obj, dict):
+            return []
+        if obj.get("error"):
+            self._closed = True
+            return []
+        out: List[str] = []
+        for chat_obj in self._gem.feed(obj):
+            out.extend(self._emit_openai(chat_obj))
+        if self._gem.usage:
+            self.usage = self._gem.usage
+        if self._gem.closed:
+            out.extend(self._finish_client())
+            self._closed = True
+        return out
+
+    def finish(self) -> List[str]:
+        if self._closed:
+            return []
+        out: List[str] = []
+        for chat_obj in self._gem.finish():
+            out.extend(self._emit_openai(chat_obj))
+        if self._gem.usage:
+            self.usage = self._gem.usage
+        out.extend(self._finish_client())
+        self._closed = True
+        return out
 
 
 class ProtocolStreamBridge:

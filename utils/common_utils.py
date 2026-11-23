@@ -922,6 +922,72 @@ def dump_openai_request_debug(req_id: str, parsed_body: dict, body: bytes) -> No
         process_log.exception("dump openai request failed req=%s", req_id)
 
 
+def summarize_body_composition(parsed_body: dict, body_len: int) -> str:
+    """把请求体按字段/条目拆成「原始字节 + 单独 gzip 后字节」，用于定位不可压缩内容。
+
+    只统计长度与压缩后体积，不输出任何原文。由环境变量 BODY_PROBE=1 触发，
+    采样 N 次后自动停止（见 main.py 的调用点）。
+    """
+    import gzip as _gzip
+
+    if not isinstance(parsed_body, dict):
+        return "body_probe unavailable"
+
+    def size_of(value) -> int:
+        try:
+            return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return -1
+
+    def gz_size(value) -> int:
+        try:
+            raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            return len(_gzip.compress(raw, 1))
+        except Exception:
+            return -1
+
+    parts = []
+    for key, value in parsed_body.items():
+        raw_len = size_of(value)
+        if raw_len < 2048:
+            continue
+        gz_len = gz_size(value)
+        ratio = (gz_len * 100 // raw_len) if raw_len > 0 and gz_len >= 0 else -1
+        parts.append((raw_len, f"{key}:{raw_len//1024}KB/gz{gz_len//1024}KB({ratio}%)"))
+
+    # input 数组按条目类型拆解，找出哪类条目贡献了不可压缩字节
+    items = parsed_body.get("input")
+    if isinstance(items, list):
+        agg = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            itype = str(item.get("type") or ("message" if item.get("role") else "?"))
+            raw_len = size_of(item)
+            gz_len = gz_size(item)
+            cur = agg.setdefault(itype, [0, 0, 0])
+            cur[0] += 1
+            cur[1] += raw_len
+            cur[2] += gz_len if gz_len >= 0 else raw_len
+        for itype, (count, raw_sum, gz_sum) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
+            ratio = (gz_sum * 100 // raw_sum) if raw_sum else 0
+            parts.append((
+                raw_sum,
+                f"input[{itype}]x{count}={raw_sum//1024}KB/gz{gz_sum//1024}KB({ratio}%)",
+            ))
+
+    tools = parsed_body.get("tools")
+    if isinstance(tools, list) and tools:
+        raw_sum = size_of(tools)
+        gz_sum = gz_size(tools)
+        ratio = (gz_sum * 100 // raw_sum) if raw_sum else 0
+        parts.append((raw_sum, f"tools x{len(tools)}={raw_sum//1024}KB/gz{gz_sum//1024}KB({ratio}%)"))
+
+    parts.sort(key=lambda item: -item[0])
+    head = " ".join(text for _, text in parts[:12])
+    return f"len={body_len//1024}KB {head}"
+
+
 def summarize_request_keys(parsed_body: dict) -> str:
     if not isinstance(parsed_body, dict):
         return "-"

@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import os
 import time
@@ -18,8 +19,9 @@ from starlette.middleware.cors import CORSMiddleware
 
 from settings.capacity import CAPACITY
 from settings.macro import (
-    CLAUDE_GPT_KEY, DOR2CHY, LEGACY_UPSTREAM_BASE, PROFIT_MULTIPLIER, TEAMO_HTTP_PROXY,
-    TEAMO_UPSTREAM, UPSTREAM_BASE, VENDOR_HTTP_PROXY, VENDOR_UPSTREAM,
+    CLAUDE_GPT_KEY, DOR2CHY, IMAGE_MEMO_ENABLED, LEGACY_UPSTREAM_BASE, PROFIT_MULTIPLIER,
+    SERVICE_TIER_MULTIPLIERS, TEAMO_HTTP_PROXY, TEAMO_UPSTREAM, UPSTREAM_BASE,
+    VENDOR_HTTP_PROXY, VENDOR_UPSTREAM,
 )
 from utils.agent_task import (
     bind_agent_task,
@@ -95,6 +97,7 @@ from utils.common_utils import (
     sanitize_headers,
     sanitize_openai_chat_request,
     sanitize_stateless_responses_input,
+    summarize_body_composition,
     summarize_request_keys,
     split_sse_events_bytes,
 )
@@ -104,6 +107,7 @@ from utils.cursor_adapter import (
     sanitize_cursor_openai_request,
 )
 from utils.image_billing import compute_image_charge, extract_image_usage, lookup_image_price
+from utils.image_memo import rewrite_history_images
 from settings.database import AsyncSessionLocal, async_engine
 from settings.models import (
     AgentTask,
@@ -162,8 +166,11 @@ from utils.api_key_auth import billing_key_for_user, lookup_user_by_credential, 
 from utils.check_user import extract_user_key
 from utils.model_route import (
     delete_route,
+    ensure_model_route_indexes,
     list_routes,
+    normalize_route_pattern,
     overlay_catalog_rows,
+    pattern_specificity,
     reload_routes,
     replace_route_api_keys,
     resolve_runtime_for_model,
@@ -188,6 +195,7 @@ from utils.soft_route import (
 from utils.user_price import (
     apply_user_price_to_catalog,
     delete_user_price,
+    ensure_user_price_schema_columns,
     list_user_prices,
     match_user_price,
     reload_user_prices,
@@ -219,10 +227,23 @@ from utils.model_protocol import (
     upsert_protocol,
 )
 from utils.protocol_adapt import (
+    GeminiToClientStream,
     ProtocolStreamBridge,
+    convert_request,
     convert_upstream_error,
     convert_upstream_response,
     prepare_protocol_upstream,
+)
+from utils.gemini_native import (
+    enable_image_output,
+    gemini_error_to_client,
+    gemini_response_to_chat,
+    gemini_response_to_images,
+    gemini_usage_tokens,
+    is_gemini_image_model,
+    is_gemini_model,
+    openai_chat_to_gemini,
+    openai_images_to_gemini,
 )
 from utils.prompt_injection import (
     apply_prompt_injection,
@@ -250,7 +271,7 @@ from utils.request_usage import (
     start_request_usage,
 )
 from utils.unbilled_billing import unbilled_supervisor, usage_has_billable_tokens, usage_is_billed
-from utils.get_log import access_log, deepseek_slow_log, process_log, setup_standalone_logging
+from utils.get_log import access_log, slow_ttfb_log, process_log, setup_standalone_logging
 from utils.headroom_compress import get_stats, maybe_compress_request, warmup_headroom
 
 
@@ -283,8 +304,24 @@ UPSTREAM_DRAIN_TIMEOUT = float(os.environ.get("UPSTREAM_DRAIN_TIMEOUT") or 60.0)
 # 超过该体积的请求体，写超时后不再重试：重传等于把同样的数据再搬一遍，
 # 只会继续占满上行、把客户端多挂几分钟。
 UPSTREAM_LARGE_BODY_BYTES = 4 * 1024 * 1024
-# DeepSeek 首字超过该阈值单独记录到 deepseek_slow.log，便于事后分析慢请求。
-DEEPSEEK_SLOW_TTFB_MS = 10_000
+# 首字超过该阈值单独记录到 slow_ttfb.log，便于事后拆解耗时归属。
+# 早先只对 deepseek 生效、阈值 10s；实测全模型都有长时间排队，故放开到全部模型。
+SLOW_TTFB_MS = 15_000
+# 请求体 gzip：agent 上下文高度重复（实测 2MB → 20KB），压缩越狠上传越短。
+# 小请求压缩收益不抵 CPU，设下限；级别取 1，速度优先，压缩率与 6 级几乎相同。
+UPSTREAM_GZIP_MIN_BYTES = int(os.environ.get("UPSTREAM_GZIP_MIN_BYTES") or 256 * 1024)
+UPSTREAM_GZIP_LEVEL = int(os.environ.get("UPSTREAM_GZIP_LEVEL") or 1)
+# 不是所有上游都吃 gzip 请求体，解析失败会直接 400/415。默认全部开启，
+# 需要排除的号商在这里留口子。
+UPSTREAM_GZIP_SKIP_VENDORS = {
+    item.strip().lower()
+    for item in (os.environ.get("UPSTREAM_GZIP_SKIP_VENDORS") or "").split(",")
+    if item.strip()
+}
+# 请求体构成一次性体检：BODY_PROBE=1 打开，采样 BODY_PROBE_N 条后自动停止。
+BODY_PROBE_ENABLED = (os.environ.get("BODY_PROBE") or "").strip() in {"1", "true", "yes"}
+# 用可变容器持有剩余次数，避免在请求处理函数里写 global。
+BODY_PROBE_STATE = {"remaining": int(os.environ.get("BODY_PROBE_N") or 20)}
 
 
 def format_upstream_exc(exc: BaseException) -> str:
@@ -519,10 +556,12 @@ async def lifespan(app: FastAPI):
                 await conn.run_sync(VendorModelPrice.__table__.create, checkfirst=True)
                 await conn.run_sync(UserApiKey.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRoute.__table__.create, checkfirst=True)
+                await ensure_model_route_indexes(conn)
                 await conn.run_sync(SoftRoute.__table__.create, checkfirst=True)
                 await conn.run_sync(SoftRouteEpoch.__table__.create, checkfirst=True)
                 await conn.run_sync(SoftRouteState.__table__.create, checkfirst=True)
                 await conn.run_sync(UserModelPrice.__table__.create, checkfirst=True)
+                await ensure_user_price_schema_columns(conn)
                 await conn.run_sync(ModelProtocol.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelAlias.__table__.create, checkfirst=True)
                 await conn.run_sync(ModelRewrite.__table__.create, checkfirst=True)
@@ -686,6 +725,79 @@ def _stream_error_chunks(source: str, message: str, status_code: int = 502):
         + "\n\n"
     ).encode("utf-8")
     yield b"data: [DONE]\n\n"
+
+
+def _nonstream_json_to_sse_events(source: str, payload: dict) -> list[str]:
+    """把上游误回的非流式 JSON 还原成一串 SSE 事件文本。
+
+    部分号商对 stream=true 的请求仍直接回完整 message / completion。这不是错误，
+    重试只会让客户端多等几轮、拿到同一个结果，所以按客户端协议补齐成流式帧，
+    一次性下发。返回空列表表示无法识别，调用方仍走失败分支。
+    """
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    events: list[str] = []
+    if source == "anthropic":
+        # 已经是 Anthropic message：把它拆成 message_start / content_block_* / message_delta。
+        if payload.get("type") != "message" or not isinstance(payload.get("content"), list):
+            return []
+        message = {k: v for k, v in payload.items() if k != "content"}
+        message.setdefault("role", "assistant")
+        events.append(
+            "event: message_start\ndata: "
+            + json.dumps({"type": "message_start", "message": message}, ensure_ascii=False)
+            + "\n\n"
+        )
+        for index, block in enumerate(payload["content"]):
+            if not isinstance(block, dict):
+                continue
+            events.append(
+                "event: content_block_start\ndata: "
+                + json.dumps(
+                    {"type": "content_block_start", "index": index, "content_block": block},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+        delta = {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": payload.get("stop_reason") or "end_turn",
+                "stop_sequence": payload.get("stop_sequence"),
+            },
+        }
+        if payload.get("usage"):
+            delta["usage"] = payload["usage"]
+        events.append(
+            "event: message_delta\ndata: " + json.dumps(delta, ensure_ascii=False) + "\n\n"
+        )
+        events.append("event: message_stop\ndata: " + json.dumps({"type": "message_stop"}) + "\n\n")
+        return events
+    if source == "openai":
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return []
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        chunk = {
+            "id": payload.get("id") or "",
+            "object": "chat.completion.chunk",
+            "created": payload.get("created") or 0,
+            "model": payload.get("model") or "",
+            "choices": [
+                {
+                    "index": choice.get("index", 0),
+                    "delta": message,
+                    "finish_reason": choice.get("finish_reason"),
+                }
+            ],
+        }
+        if payload.get("usage"):
+            chunk["usage"] = payload["usage"]
+        events.append("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n")
+        events.append("data: [DONE]\n\n")
+        return events
+    return events
 
 
 def _is_gpt_audio_model(model: str) -> bool:
@@ -1031,7 +1143,7 @@ def is_deepseek_model(model: str) -> bool:
     return name.startswith("deepseek")
 
 
-def _log_deepseek_slow(
+def _log_slow_ttfb(
     *,
     request: Request,
     req_id: str,
@@ -1044,20 +1156,30 @@ def _log_deepseek_slow(
     stage: str,
     started: float,
     first_event_at: float,
+    body_read_at: Optional[float],
     headers_at: Optional[float],
     body_len: int,
     heartbeats: int,
     headers: dict,
     parsed_body: dict,
 ):
-    """DeepSeek 上游首字超过阈值时单独留档，便于事后按供应商分析慢请求。"""
+    """首字超过阈值时单独留档，并把耗时拆成三段定位归属。
+
+    upload_ms   请求体读取完成（含客户端上传阶段，只增不减）
+    headers_ms  到达上游响应头，扣掉 upload 即本地处理+上游建连排队
+    first_ms    上游响应头到首个上游事件，纯上游首包等待
+    三者相加约等于 ttfb_ms，用来判断慢在客户端上传、本地处理还是上游。
+    """
     ttfb_ms = _elapsed_ms(started, first_event_at)
-    if ttfb_ms < DEEPSEEK_SLOW_TTFB_MS:
+    if ttfb_ms < SLOW_TTFB_MS:
         return
-    deepseek_slow_log.info(
+    upload_ms = _elapsed_ms(started, body_read_at) if body_read_at is not None else -1
+    headers_ms = _elapsed_ms(started, headers_at) if headers_at is not None else -1
+    first_ms = _elapsed_ms(headers_at, first_event_at) if headers_at is not None else -1
+    slow_ttfb_log.info(
         "slow_ttfb req=%s ip=%s user=%s source=%s model=%s upstream_model=%s path=%s "
-        "base_url=%s target_url=%s stage=%s ttfb_ms=%s headers_ms=%s "
-        "body_bytes=%s heartbeats=%s beta=%s keys=%s session=%s",
+        "base_url=%s target_url=%s stage=%s ttfb_ms=%s upload_ms=%s headers_ms=%s "
+        "first_ms=%s body_bytes=%s heartbeats=%s beta=%s keys=%s session=%s",
         req_id,
         _client_ip(request),
         user_id or "-",
@@ -1069,7 +1191,9 @@ def _log_deepseek_slow(
         target_url,
         stage,
         ttfb_ms,
-        _elapsed_ms(started, headers_at) if headers_at is not None else "-",
+        upload_ms,
+        headers_ms,
+        first_ms,
         body_len,
         heartbeats,
         (_header_value(headers, "anthropic-beta") or "-")[:160],
@@ -1167,7 +1291,12 @@ async def _charge_if_needed(
                 charged_usd=(summary or {}).get("usd_cost"),
             )
 
-        if is_image_path(path) or is_gemini_native_path(path):
+        # usage 里带 kind=image 的（Gemini 桥接生图走 chat 入口时）也按图片计费。
+        if (
+            is_image_path(path)
+            or is_gemini_native_path(path)
+            or (isinstance(usage, dict) and usage.get("kind") == "image")
+        ):
             if not usage:
                 _note_teamo_fallback()
                 return None
@@ -1282,6 +1411,8 @@ async def log_and_forward_requests(request: Request, call_next):
     except Exception:
         process_log.exception("req=%s failed to read request body", req_id)
         body = b""
+    # 读完请求体的时刻：与 started 的差值包含客户端上传耗时，用于判断慢在上传还是上游。
+    body_read_at = time.perf_counter()
 
     headers = sanitize_headers(dict(request.headers))
     parsed_body = parse_request_payload(dict(request.headers), body)
@@ -1512,6 +1643,32 @@ async def log_and_forward_requests(request: Request, call_next):
     # 这里只改 parsed_body，序列化推迟到转发前：中间步骤还会改 model、清字段，
     # 每一步都重 dump 一次的话，带图请求要白搬好几遍几 MB 的 base64。
     pending_body_rewrite = False
+    # 历史图片转文字：模型上一轮写过图片笔记时，把旧的图片块换成笔记正文。
+    # 只动最后一个 user 消息之前的历史，当前轮新上传的图片仍原样发给上游。
+    # 必须在协议转换之前做，三条协议和 Gemini 桥接因此都能生效。
+    if (
+        IMAGE_MEMO_ENABLED
+        and not legacy_audio_request
+        and not count_tokens_route
+        and not is_audio_path(request.url.path)
+        and not is_image_path(request.url.path)
+        and not is_gemini_native_path(request.url.path)
+        and isinstance(parsed_body, dict)
+    ):
+        memo_body, memo_replaced, memo_chars = rewrite_history_images(
+            parsed_body, source, enabled=True
+        )
+        if memo_replaced:
+            parsed_body = memo_body
+            pending_body_rewrite = True
+            process_log.info(
+                "image memo rewrite req=%s source=%s model=%s replaced=%s chars=%s",
+                req_id,
+                source,
+                model,
+                memo_replaced,
+                memo_chars,
+            )
     body, parsed_body = apply_upstream_model_to_request(
         body,
         parsed_body,
@@ -1747,9 +1904,58 @@ async def log_and_forward_requests(request: Request, call_next):
         if normalized_parsed is not parsed_body:
             body, parsed_body = normalized_body, normalized_parsed
             headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+    # 号商开了 gemini_native 开关时，OpenAI / Responses / Anthropic / Images 入口的
+    # Gemini 模型统一改走原生 /v1beta。只对 Gemini 模型生效，其它模型不动。
+    gemini_bridge = bool(
+        not count_tokens_route
+        and not legacy_audio_request
+        and runtime.get("gemini_native")
+        and is_gemini_model(model)
+        and not gemini_native_route
+    )
+    gemini_bridge_image = gemini_bridge and is_gemini_image_model(model)
+    # 客户端原始请求体：桥接改写后计费仍按客户端模型/参数计价，必须留一份。
+    client_parsed_body = parsed_body
+    gemini_chain = False
+    if gemini_bridge:
+        if source in {"openai", "anthropic", "responses"}:
+            bridged = convert_request(parsed_body if isinstance(parsed_body, dict) else {}, source, "openai")
+            if is_image_path(request.url.path):
+                gemini_body = openai_images_to_gemini(bridged, model=model)
+            else:
+                gemini_body = openai_chat_to_gemini(bridged)
+        else:
+            # images 入口（/v1/images/*）的 prompt 直接映射成生图请求
+            gemini_body = openai_images_to_gemini(parsed_body if isinstance(parsed_body, dict) else {}, model=model)
+        if gemini_bridge_image and not is_image_path(request.url.path):
+            enable_image_output(gemini_body)
+        parsed_body = gemini_body
+        body = json.dumps(gemini_body, ensure_ascii=False).encode("utf-8")
+        headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+        for key in list(headers):
+            lowered = key.lower()
+            if lowered.startswith("anthropic-") or lowered in {"accept", "accept-encoding"}:
+                headers.pop(key, None)
+        headers["content-type"] = "application/json"
+        upstream_path = (
+            f"/v1beta/models/{upstream_model}:streamGenerateContent"
+            if want_stream
+            else f"/v1beta/models/{upstream_model}:generateContent"
+        )
+        # OpenAI / Responses / Anthropic 入口的 Gemini 流量，流式还要把上游
+        # Gemini SSE 转回客户端协议；图片入口保持原样透传。
+        gemini_chain = source in {"openai", "anthropic", "responses"} and not is_image_path(request.url.path)
+        headers["accept"] = "text/event-stream" if want_stream and gemini_chain else "application/json"
+        process_log.info(
+            "gemini native bridge req=%s src=%s model=%s image=%s stream=%s",
+            req_id, source, model, int(gemini_bridge_image), int(want_stream),
+        )
     target_url = f"{request_base}{upstream_path}"
     # Anthropic/Responses 桥接后不要把原 query 原样带给目标端点
-    if gemini_native_route:
+    if gemini_bridge:
+        # xcmapi 这类号商：带 alt=sse 会 502，不带时 streamGenerateContent 直接回 SSE。
+        target_url += ""
+    elif gemini_native_route:
         # Gemini 的流式开关在 query 上；客户端 key 一律丢弃，只保留其余参数。
         query = gemini_upstream_query(request.url.query, force_sse=gemini_sse)
         if query:
@@ -1832,6 +2038,29 @@ async def log_and_forward_requests(request: Request, call_next):
         # 未带 Content-Length 的原样保留客户端字节，缓存前缀不受影响。
         body = json.dumps(parsed_body, ensure_ascii=False).encode("utf-8")
         headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+    # agent 上下文高度重复，gzip 通常能砍掉 9 成以上体积；上传是首字的一部分，
+    # 大 body（p99 近 10MB）尤其明显。只在明显偏大时才压，小请求不值得多花 CPU。
+    # 原始体积留给日志与重试判定：压缩后的大小会让 slow_ttfb 的 body_bytes 失真。
+    upstream_body_bytes = len(body or b"")
+    if (
+        upstream_body_bytes >= UPSTREAM_GZIP_MIN_BYTES
+        and runtime_vendor not in UPSTREAM_GZIP_SKIP_VENDORS
+        and not any(k.lower() == "content-encoding" for k in headers)
+    ):
+        compressed = await asyncio.to_thread(
+            gzip.compress, body, UPSTREAM_GZIP_LEVEL
+        )
+        if len(compressed) < len(body):
+            process_log.info(
+                "gzip request body req=%s %s -> %s (%.1f%%)",
+                req_id,
+                len(body),
+                len(compressed),
+                len(compressed) * 100.0 / max(len(body), 1),
+            )
+            body = compressed
+            headers = {k: v for k, v in headers.items() if k.lower() != "content-length"}
+            headers["content-encoding"] = "gzip"
     process_log.info(
         "forward req=%s user=%s url=%s source=%s model=%s upstream_model=%s bridge=%s resp_bridge=%s cursor=%s keys=%s",
         req_id,
@@ -1845,6 +2074,16 @@ async def log_and_forward_requests(request: Request, call_next):
         int(cursor_client),
         summarize_request_keys(parsed_body),
     )
+    # 一次性体检：BODY_PROBE=1 时采样前 BODY_PROBE_N 条转发请求的字段构成，
+    # 只记录各字段原始/压缩后字节，不落原文。采样完自动停，避免长期开销。
+    if BODY_PROBE_ENABLED and BODY_PROBE_STATE["remaining"] > 0:
+        BODY_PROBE_STATE["remaining"] -= 1
+        process_log.info(
+            "body probe req=%s model=%s %s",
+            req_id,
+            upstream_model,
+            summarize_body_composition(parsed_body, upstream_body_bytes),
+        )
 
     # teamo 走 TEAMO_HTTP_PROXY；其它号商按后台 use_proxy 勾选走 VENDOR_HTTP_PROXY
     # （未配置 VENDOR_HTTP_PROXY 时回落到 TEAMO_HTTP_PROXY，行为与之前一致）。
@@ -1892,12 +2131,16 @@ async def log_and_forward_requests(request: Request, call_next):
         sse_buf = b""
         upstream_status = 0
         first_sse_at: Optional[float] = None
+        first_heartbeat_at: Optional[float] = None
         upstream_headers_at: Optional[float] = None
         first_upstream_event_at: Optional[float] = None
-        deepseek_slow_logged = False
-        deepseek_ttfb_evaluated = False
+        slow_ttfb_logged = False
+        slow_ttfb_evaluated = False
         def make_bridge_stream():
             client_model = model if model != "-" else ""
+            # 桥到 Gemini 原生时，客户端协议还要再转一层，优先用专用桥。
+            if gemini_chain:
+                return GeminiToClientStream(source, client_model)
             if anthropic_bridge:
                 return OpenAIToAnthropicStream(client_model=client_model)
             if responses_bridge:
@@ -1908,38 +2151,79 @@ async def log_and_forward_requests(request: Request, call_next):
 
         bridge_stream = make_bridge_stream()
 
+        def bridge_feed(obj: Optional[dict]) -> list[str]:
+            """把上游对象喂给桥接器，按上游 → 客户端的协议分别调用。"""
+            if bridge_stream is None:
+                return []
+            if isinstance(bridge_stream, GeminiToClientStream):
+                return bridge_stream.feed(obj)
+            return [
+                chunk.decode("utf-8")
+                for chunk in bridge_stream.feed_openai_event(obj)
+            ]
+
+        def bridge_close() -> list[str]:
+            if bridge_stream is None:
+                return []
+            if isinstance(bridge_stream, GeminiToClientStream):
+                return bridge_stream.finish()
+            return [chunk.decode("utf-8") for chunk in bridge_stream.finish()]
+
+        def bridge_usage() -> dict:
+            if isinstance(bridge_stream, GeminiToClientStream) and bridge_stream.usage:
+                return bridge_stream.usage
+            return {}
+
+        def bridge_is_closed() -> bool:
+            if bridge_stream is None:
+                return True
+            if isinstance(bridge_stream, GeminiToClientStream):
+                return bridge_stream.closed
+            return bool(bridge_stream._closed)
+
         def mark_first_sse():
             nonlocal first_sse_at
             if first_sse_at is None:
                 first_sse_at = time.perf_counter()
+
+        def mark_first_heartbeat():
+            """心跳只记首次客户端写入，不算首字。
+
+            早先心跳分支也调 mark_first_sse()，上游首包一慢就每 10s 心跳一次，
+            首字被钉在 10s、20s 这类心跳刻度上，看起来"总是 10s"，反而掩盖真实延迟。
+            """
+            nonlocal first_heartbeat_at
+            if first_heartbeat_at is None:
+                first_heartbeat_at = time.perf_counter()
 
         def current_ttfb_ms():
             if first_sse_at is None:
                 return None
             return _elapsed_ms(started, first_sse_at)
 
-        def note_deepseek_slow_ttfb(stage: str, observed_at: Optional[float] = None):
-            """DeepSeek 上游首字超过阈值时单独留档，便于事后按供应商分析。
+        def current_upstream_headers_ms():
+            if upstream_headers_at is None:
+                return None
+            return _elapsed_ms(started, upstream_headers_at)
+
+        def note_slow_ttfb(stage: str, observed_at: Optional[float] = None):
+            """首字超过阈值时单独留档，全部模型生效。
 
             observed_at 是判定用的时间点：正常是首个上游 SSE 事件；若上游始终
             没有事件（404 / 空流 / 客户端先断开），用当前时间兜底，同样能留档。
             每个请求只判定一次：首事件一旦到达就定格，避免把总耗时误当首字耗时。
             """
-            nonlocal deepseek_slow_logged, deepseek_ttfb_evaluated
-            if (
-                deepseek_ttfb_evaluated
-                or runtime_vendor != "deepseek"
-                or not is_deepseek_model(model)
-            ):
+            nonlocal slow_ttfb_logged, slow_ttfb_evaluated
+            if slow_ttfb_evaluated:
                 return
             at = observed_at if observed_at is not None else first_upstream_event_at
             if at is None:
                 return
-            deepseek_ttfb_evaluated = True
-            if _elapsed_ms(started, at) < DEEPSEEK_SLOW_TTFB_MS:
+            slow_ttfb_evaluated = True
+            if _elapsed_ms(started, at) < SLOW_TTFB_MS:
                 return
-            deepseek_slow_logged = True
-            _log_deepseek_slow(
+            slow_ttfb_logged = True
+            _log_slow_ttfb(
                 request=request,
                 req_id=req_id,
                 user_id=user_id,
@@ -1951,8 +2235,9 @@ async def log_and_forward_requests(request: Request, call_next):
                 stage=stage,
                 started=started,
                 first_event_at=at,
+                body_read_at=body_read_at,
                 headers_at=upstream_headers_at,
-                body_len=len(body or b""),
+                body_len=upstream_body_bytes,
                 heartbeats=heartbeats,
                 headers=headers,
                 parsed_body=parsed_body,
@@ -2104,7 +2389,7 @@ async def log_and_forward_requests(request: Request, call_next):
         def access_stream(*, status: int, extra: str = ""):
             done_at = time.perf_counter()
             # 上游始终没吐事件（含 404 / 空流 / 客户端先走）时，用结束时刻兜底判定。
-            note_deepseek_slow_ttfb("stream_end", done_at)
+            note_slow_ttfb("stream_end", done_at)
             parts = []
             inferred = last_result
             if not inferred:
@@ -2189,7 +2474,7 @@ async def log_and_forward_requests(request: Request, call_next):
             # 扣成之后才标记，避免客户端断开取消协程后，补扣被跳过。
             summary = await _charge_if_needed(
                 usage or {},
-                parsed_body,
+                client_parsed_body if gemini_bridge else parsed_body,
                 user_id,
                 source,
                 request.url.path,
@@ -2269,7 +2554,7 @@ async def log_and_forward_requests(request: Request, call_next):
             nonlocal first_upstream_event_at
             if first_upstream_event_at is None:
                 first_upstream_event_at = time.perf_counter()
-                note_deepseek_slow_ttfb("first_upstream_event")
+                note_slow_ttfb("first_upstream_event")
             obj = parse_sse_block(event_text)
             if obj:
                 collector.note_block_index(obj)
@@ -2323,7 +2608,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                 break
                             except asyncio.TimeoutError:
                                 heartbeats += 1
-                                mark_first_sse()
+                                mark_first_heartbeat()
                                 yield b": keep-alive\n\n"
                         assert resp is not None
                         upstream_headers_at = time.perf_counter()
@@ -2372,6 +2657,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                         resp.status_code,
                                         err_text[:800].replace("\n", " "),
                                     )
+                                    # Gemini 错误体也是 {"error":{"message":...}}，同一套提取可用。
                                     err_msg = _extract_upstream_error_message(err_text, resp.status_code)
                                     for chunk in _stream_error_chunks(source, err_msg, resp.status_code):
                                         client_events += 1
@@ -2389,7 +2675,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                     upstream_bytes = len(raw or b"")
                                     gemini_payloads = (
                                         parse_gemini_stream_payloads(raw)
-                                        if gemini_native_route and resp.status_code < 400
+                                        if (gemini_native_route or gemini_bridge) and resp.status_code < 400
                                         else []
                                     )
                                     if gemini_payloads:
@@ -2399,9 +2685,36 @@ async def log_and_forward_requests(request: Request, call_next):
                                                 + json.dumps(item, ensure_ascii=False)
                                                 + "\n\n"
                                             )
+                                            if gemini_bridge and bridge_stream is not None:
+                                                # 上游没回 SSE，桥接器照样吃 Gemini 对象。
+                                                for conv_text in bridge_feed(item):
+                                                    conv_obj = parse_sse_block(conv_text)
+                                                    conv_usage = None
+                                                    if conv_obj:
+                                                        collector.note_block_index(conv_obj)
+                                                        conv_usage = extract_usage(conv_obj)
+                                                        if conv_usage:
+                                                            collector.usage = conv_usage
+                                                    async for out in emit_downstream(conv_text, conv_obj, conv_usage):
+                                                        yield out
+                                                continue
                                             obj, usage = handle_event(text)
                                             async for out in emit_downstream(text, obj, usage):
                                                 yield out
+                                        if gemini_bridge and bridge_stream is not None:
+                                            for conv_text in bridge_close():
+                                                conv_obj = parse_sse_block(conv_text)
+                                                conv_usage = None
+                                                if conv_obj:
+                                                    collector.note_block_index(conv_obj)
+                                                    conv_usage = extract_usage(conv_obj)
+                                                    if conv_usage:
+                                                        collector.usage = conv_usage
+                                                async for out in emit_downstream(conv_text, conv_obj, conv_usage):
+                                                    yield out
+                                            gem_usage = bridge_usage()
+                                            if gem_usage:
+                                                collector.usage = gem_usage
                                         saw_terminator = True
                                         # 这条分支不经过下面的 SSE 读取段，计费要在这里补齐。
                                         if not billed:
@@ -2433,6 +2746,47 @@ async def log_and_forward_requests(request: Request, call_next):
                                             resp.status_code,
                                             err_text[:800].replace("\n", " "),
                                         )
+                                        # 完整应答被当成 JSON 回：按 SSE 补齐直接下发。
+                                        # 重试只会让客户端多等几轮、拿到同样的结果，纯粹放大首字。
+                                        recovered: list[str] = []
+                                        try:
+                                            recovered = _nonstream_json_to_sse_events(source, json.loads(err_text))
+                                        except Exception:
+                                            recovered = []
+                                        if recovered:
+                                            for conv_text in recovered:
+                                                conv_obj = parse_sse_block(conv_text)
+                                                conv_usage = None
+                                                if conv_obj:
+                                                    collector.note_block_index(conv_obj)
+                                                    conv_usage = extract_usage(conv_obj)
+                                                    if conv_usage:
+                                                        collector.usage = conv_usage
+                                                async for out in emit_downstream(conv_text, conv_obj, conv_usage):
+                                                    yield out
+                                                if bridge_stream is not None:
+                                                    # 桥接层也要吃掉这批事件，否则客户端只看到不完整流。
+                                                    for bridged in bridge_feed(conv_obj):
+                                                        bridged_obj = parse_sse_block(bridged)
+                                                        async for out in emit_downstream(bridged, bridged_obj, None):
+                                                            yield out
+                                            saw_terminator = True
+                                            if not billed:
+                                                leftover_usage = collector.flush() or collector.usage
+                                                if leftover_usage or (runtime_teamo and collector.request_id):
+                                                    await charge_once(leftover_usage or {})
+                                            if billing:
+                                                billing["next_block_index"] = max(
+                                                    collector.max_block_index + 1, 1
+                                                )
+                                            process_log.info(
+                                                "stream json-recovered req=%s status=%s bytes=%s events=%s",
+                                                req_id,
+                                                resp.status_code,
+                                                upstream_bytes,
+                                                len(recovered),
+                                            )
+                                            break
                                         if attempt < UPSTREAM_RETRY_ATTEMPTS:
                                             retry_stream = True
                                         else:
@@ -2472,7 +2826,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                             if sse_buf:
                                                 continue
                                             heartbeats += 1
-                                            mark_first_sse()
+                                            mark_first_heartbeat()
                                             yield b": keep-alive\n\n"
                                             continue
                                         upstream_bytes += len(chunk or b"")
@@ -2490,8 +2844,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                                 )
                                             obj, usage = handle_event(event_text)
                                             if bridge_stream is not None:
-                                                for converted in bridge_stream.feed_openai_event(obj):
-                                                    conv_text = converted.decode("utf-8")
+                                                for conv_text in bridge_feed(obj):
                                                     conv_obj = parse_sse_block(conv_text)
                                                     if conv_obj:
                                                         collector.note_block_index(conv_obj)
@@ -2523,8 +2876,7 @@ async def log_and_forward_requests(request: Request, call_next):
                                             leftover_text = leftover.decode("utf-8", errors="replace")
                                         obj, usage = handle_event(leftover_text)
                                         if bridge_stream is not None:
-                                            for converted in bridge_stream.feed_openai_event(obj):
-                                                conv_text = converted.decode("utf-8")
+                                            for conv_text in bridge_feed(obj):
                                                 conv_obj = parse_sse_block(conv_text)
                                                 if conv_obj:
                                                     collector.note_block_index(conv_obj)
@@ -2540,11 +2892,11 @@ async def log_and_forward_requests(request: Request, call_next):
                                     # 只有上游明确发送完成事件后，桥接器才能正常 finish。
                                     if (
                                         bridge_stream is not None
-                                        and not bridge_stream._closed
-                                        and saw_terminator
+                                        and not bridge_is_closed()
+                                        and (saw_terminator or gemini_bridge)
                                     ):
-                                        for converted in bridge_stream.finish():
-                                            conv_text = converted.decode("utf-8")
+                                        # Gemini 上游靠关连接结束，没有 [DONE]，桥接器负责补终止帧。
+                                        for conv_text in bridge_close():
                                             conv_obj = parse_sse_block(conv_text)
                                             conv_usage = None
                                             if conv_obj:
@@ -2554,6 +2906,9 @@ async def log_and_forward_requests(request: Request, call_next):
                                                     collector.usage = conv_usage
                                             async for out in emit_downstream(conv_text, conv_obj, conv_usage):
                                                 yield out
+                                        gem_usage = bridge_usage()
+                                        if gem_usage:
+                                            collector.usage = gem_usage
 
                                     # Gemini / Images 的正常结束常常就是上游关闭连接，
                                     # 不能再追加一条错误事件，否则客户端会把成功结果当成失败。
@@ -2702,7 +3057,7 @@ async def log_and_forward_requests(request: Request, call_next):
                         await _note_soft_route_error(502)
                         return
                     if not should_retry_stream_transport(
-                        exc, attempt, client_events, len(body or b""),
+                        exc, attempt, client_events, upstream_body_bytes,
                     ):
                         raise
                     retry_stream = True
@@ -2765,33 +3120,119 @@ async def log_and_forward_requests(request: Request, call_next):
         )
         process_log.info("upstream req=%s status=%s", req_id, resp.status_code)
         upstream_at = time.perf_counter()
-        if runtime_vendor == "deepseek" and is_deepseek_model(model):
-            # 非流式同样记录慢首包，判定点是上游返回整个响应体的时刻。
-            _log_deepseek_slow(
-                request=request,
+        # 非流式同样记录慢首包，判定点是上游返回整个响应体的时刻。
+        _log_slow_ttfb(
+            request=request,
+            req_id=req_id,
+            user_id=user_id,
+            source=source,
+            model=model,
+            upstream_model=upstream_model,
+            upstream_base=request_base,
+            target_url=target_url,
+            stage="non_stream",
+            started=started,
+            first_event_at=upstream_at,
+            body_read_at=body_read_at,
+            headers_at=upstream_at,
+            body_len=upstream_body_bytes,
+            heartbeats=0,
+            headers=headers,
+            parsed_body=parsed_body,
+        )
+        parsed_resp = _parse_json_body(resp.content)
+        # Gemini 原生可能回 JSON 数组（多分片），_parse_json_body 只认对象；
+        # 取最后一个分片拿完整 usageMetadata，响应体本身仍逐字节透传。
+        if not parsed_resp and (gemini_native_route or gemini_bridge) and resp.status_code < 400:
+            gemini_items = parse_gemini_stream_payloads(resp.content)
+            if gemini_items:
+                parsed_resp = gemini_items[-1]
+        if gemini_bridge and resp.status_code >= 400:
+            # Gemini 错误体是 {"error":{"code","message","status"}}，转成客户端协议形状。
+            process_log.warning(
+                "gemini native error req=%s status=%s body=%s",
+                req_id,
+                resp.status_code,
+                (resp.content or b"")[:800].decode(errors="ignore").replace("\n", " "),
+            )
+            await finish_request_usage(req_id, resp.status_code)
+            await _note_soft_route_error(resp.status_code)
+            _log_access(
+                request,
                 req_id=req_id,
                 user_id=user_id,
                 source=source,
                 model=model,
-                upstream_model=upstream_model,
-                upstream_base=request_base,
-                target_url=target_url,
-                stage="non_stream",
+                stream=False,
+                status=resp.status_code,
                 started=started,
-                first_event_at=upstream_at,
-                headers_at=upstream_at,
-                body_len=len(body or b""),
-                heartbeats=0,
-                headers=headers,
-                parsed_body=parsed_body,
+                base_url=upstream_base,
+                done_ms=_elapsed_ms(started),
+                extra="result=upstream_error",
+                result="error",
             )
-        parsed_resp = _parse_json_body(resp.content)
-        # Gemini 原生可能回 JSON 数组（多分片），_parse_json_body 只认对象；
-        # 取最后一个分片拿完整 usageMetadata，响应体本身仍逐字节透传。
-        if not parsed_resp and gemini_native_route and resp.status_code < 400:
-            gemini_items = parse_gemini_stream_payloads(resp.content)
-            if gemini_items:
-                parsed_resp = gemini_items[-1]
+            return JSONResponse(
+                status_code=resp.status_code,
+                content=gemini_error_to_client(parsed_resp, source),
+            )
+        if gemini_bridge and resp.status_code < 400 and parsed_resp:
+            # 先按 Gemini usage 计费（原始请求体计价），再转回客户端协议。
+            usage = extract_image_usage(parsed_resp) if gemini_bridge_image else gemini_usage_tokens(parsed_resp)
+            billing = await _charge_if_needed(
+                usage,
+                client_parsed_body,
+                user_id,
+                source,
+                request.url.path,
+                req_id,
+                status_code=resp.status_code,
+                use_teamo_prices=not legacy_audio_request and runtime_teamo,
+                vendor="" if legacy_audio_request else runtime_vendor,
+                upstream_request_id=extract_teamo_request_id(parsed_resp, dict(resp.headers)),
+                http_client=client,
+                vendor_base_url="" if legacy_audio_request else upstream_base,
+                started=started,
+                first_byte_at=upstream_at,
+            )
+            await finish_request_usage(req_id, resp.status_code, usage)
+            if is_image_path(request.url.path):
+                # 只有图片入口按 Images 形状返回；chat / responses / messages
+                # 入口的 Gemini 生图模型仍回各自协议（图片放在 content parts 里）。
+                client_resp = gemini_response_to_images(parsed_resp)
+            else:
+                openai_resp = gemini_response_to_chat(parsed_resp, client_model=model if model != "-" else "")
+                client_resp = (
+                    convert_upstream_response(openai_resp, "openai", source, model if model != "-" else "")
+                    if source in {"anthropic", "responses"} else openai_resp
+                )
+            out_content = json.dumps(client_resp, ensure_ascii=False).encode("utf-8")
+            if billing:
+                billing.setdefault("model", model)
+                _merge_compression(billing, compression)
+            meta = extract_completion_meta(client_resp)
+            _log_access(
+                request,
+                req_id=req_id,
+                user_id=user_id,
+                source=source,
+                model=model,
+                stream=False,
+                status=resp.status_code,
+                started=started,
+                base_url=upstream_base,
+                done_ms=_elapsed_ms(started),
+                extra=(compression_extra + " gemini_native=1").strip(),
+                usage=usage,
+                billing=billing,
+                finish=meta.get("finish") or "",
+                result=meta.get("result") or "completed",
+            )
+            return Response(
+                content=out_content,
+                status_code=resp.status_code,
+                headers=sanitize_headers(dict(resp.headers)),
+                media_type="application/json",
+            )
         # 上游 200 回 HTML（区域封锁/网关拦截页）不是合法应答，按上游失败处理，
         # 否则会被当成成功写进软路由计数、并把整页 HTML 回给客户端。
         html_on_success = (
@@ -3243,6 +3684,7 @@ class VendorUpsert(BaseModel):
     cost_usd_cny_rate: Optional[float] = Field(default=None, gt=0, le=100)  # 真实采购汇率，仅算成本/利润
     api_key: Optional[str] = Field(default=None, max_length=512)
     use_proxy: Optional[bool] = None  # 转发该号商时是否走 TEAMO_HTTP_PROXY
+    gemini_native: Optional[bool] = None  # Gemini 模型是否改走原生 /v1beta 端点
     is_active: bool = True
     is_default: bool = False
     sort_order: int = 100
@@ -3293,18 +3735,21 @@ class ModelRouteUpsert(BaseModel):
 
 class UserModelPriceUpsert(BaseModel):
     id: Optional[int] = None
-    user_id: int
-    model: str = Field(min_length=1, max_length=255)
-    service_tier: str = "standard"
-    input_price: float = Field(default=0, ge=0)
-    output_price: float = Field(default=0, ge=0)
+    # 一条价可绑定多个用户；只传 user_id 时等同于单用户
+    user_ids: Optional[list[int]] = None
+    user_id: Optional[int] = None
+    model: Optional[str] = Field(default=None, max_length=255)
+    # 修改时这些字段不传即保持原值；新建时缺省 0 / true / ""
+    service_tier: Optional[str] = None
+    input_price: Optional[float] = Field(default=None, ge=0)
+    output_price: Optional[float] = Field(default=None, ge=0)
     cache_read_price: Optional[float] = Field(default=None, ge=0)
     cache_write_price: Optional[float] = Field(default=None, ge=0)
     text_input_price: Optional[float] = Field(default=None, ge=0)
     image_input_price: Optional[float] = Field(default=None, ge=0)
     per_image_tiers: Optional[dict] = None
-    is_active: bool = True
-    note: str = ""
+    is_active: Optional[bool] = None
+    note: Optional[str] = None
 
 
 class SoftRouteUpsert(BaseModel):
@@ -3709,6 +4154,7 @@ async def admin_upsert_vendor(payload: VendorUpsert, request: Request):
             cost_usd_cny_rate=payload.cost_usd_cny_rate,
             api_key=payload.api_key,
             use_proxy=payload.use_proxy,
+            gemini_native=payload.gemini_native,
             is_active=payload.is_active,
             is_default=payload.is_default,
             sort_order=payload.sort_order,
@@ -4119,6 +4565,141 @@ async def admin_list_user_model_prices(request: Request):
     return {"prices": list_user_prices()}
 
 
+@app.get("/v1/admin/user-model-prices/baseline")
+async def admin_user_price_baseline(
+    request: Request,
+    model: str = Query(..., min_length=1, description="模型名"),
+    service_tier: str = Query("standard"),
+    vendor: Optional[str] = Query(None, description="供应商 code，缺省用当前生效供应商"),
+):
+    """管理端：取某模型的基准价（USD/1M），供前端按折扣试算专属价。
+
+    取价顺序（以官方标准价为主）：
+    1. 官方价目表（MODEL_MAP_MONEY_DICT / OFFICIAL_PROVIDER_* 等内置官网价）
+    2. 官方价目里没有，才回落到当前供应商成本价 × 加价，并标注 source=vendor
+
+    折扣只作用在官方标准价上，不再以上游 TeamoRouter 等中转的折后价为准。
+    """
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    tier = (service_tier or "standard").strip().lower() or "standard"
+    model_name = normalize_route_pattern(model)
+
+    def pick(rows: list[dict]) -> Optional[dict]:
+        """精确名 + 档位优先，其次最长前缀兜底，与计费匹配口径一致。"""
+        exact = next((
+            item for item in rows
+            if (item.get("model") or "").strip().lower() == model_name
+            and (item.get("service_tier") or "standard") == tier
+        ), None)
+        if exact is not None:
+            return exact
+        candidates = [
+            item for item in rows
+            if pattern_specificity(item.get("model") or "", model_name) is not None
+            and (item.get("service_tier") or "standard") == tier
+        ]
+        candidates.sort(key=lambda item: -len(item.get("model") or ""))
+        return candidates[0] if candidates else None
+
+    official_rows = apply_aliases_to_catalog(list_official_catalog())
+    tier_multiplier = SERVICE_TIER_MULTIPLIERS.get(tier, 1.0)
+    if tier != "standard":
+        # 官方目录只出 standard；fast/priority 按文档倍数换算
+        official_rows = [
+            {**item, "service_tier": tier, **{
+                key: float(item.get(key) or 0) * tier_multiplier
+                for key in ("input", "output", "cache_read", "cache_write", "text_input", "image_input")
+            }}
+            for item in official_rows
+            if (item.get("service_tier") or "standard") == "standard"
+        ]
+    row = pick(official_rows)
+    official = row is not None
+    meta = None
+    price_factor = 1.0
+    if not official:
+        meta, catalog = get_vendor_catalog(vendor=(vendor or "").strip().lower())
+        if not meta:
+            return JSONResponse(status_code=404, content={"error": "vendor not found"})
+        row = pick(apply_aliases_to_catalog(catalog))
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": f"找不到 {model_name}（{tier}）的价格"})
+        config = await get_pricing_config()
+        bill_vendor = row.get("bill_vendor") or row.get("route_vendor") or meta["code"]
+        # 设了原价就按原价 1:1，否则叠供应商 × 全局加价
+        price_factor = 1.0 if has_original_prices(row) else vendor_profit_multiplier(
+            bill_vendor, config.profit_multiplier,
+        )
+    bill_prices, _cost_prices = resolve_billing_and_cost_prices(row)
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    tiers = raw.get("per_image_tiers") if isinstance(raw.get("per_image_tiers"), dict) else None
+    if tiers:
+        # 按张档位（官方或供应商快照里的 per_image_tiers）同样按 factor 换算
+        tiers = {str(k).lower(): float(v or 0) * price_factor for k, v in tiers.items()}
+    baseline = {
+        "model": row.get("model") or model_name,
+        "service_tier": row.get("service_tier") or tier,
+        "kind": row.get("kind") or "chat",
+        "vendor": meta["code"] if meta else "official",
+        "vendor_name": (meta.get("name") or meta["code"]) if meta else "官方标准价",
+        "billing_basis": "official" if official else (
+            "original" if has_original_prices(row) else "cost"
+        ),
+        "source": "official" if official else "vendor",
+        "input": float(bill_prices.get("input") or 0) * price_factor,
+        "output": float(bill_prices.get("output") or 0) * price_factor,
+        "cache_read": float(bill_prices.get("cache_read") or 0) * price_factor,
+        "cache_write": float(bill_prices.get("cache_write") or 0) * price_factor,
+        "text_input": float(row.get("text_input") or row.get("input") or 0) * price_factor,
+        "image_input": float(row.get("image_input") or 0) * price_factor,
+        "per_image_tiers": tiers,
+        "price_factor": price_factor,
+    }
+    return {"currency": "USD", "price_unit": "per 1M tokens", "baseline": baseline}
+
+
+@app.get("/v1/admin/user-model-prices/models")
+async def admin_user_price_models(
+    request: Request,
+    vendor: Optional[str] = Query(None, description="供应商 code，缺省用当前生效供应商"),
+):
+    """管理端：专属价表单的模型下拉候选（官方价目优先，供应商独有模型补在后面）。"""
+    user, error = await _require_admin(request)
+    if error:
+        return error
+    rows: dict[tuple[str, str], dict] = {}
+
+    def add(item: dict, source: str) -> None:
+        name = (item.get("model") or "").strip()
+        if not name:
+            return
+        tier = (item.get("service_tier") or "standard").strip().lower() or "standard"
+        rows.setdefault((name, tier), {
+            "model": name,
+            "service_tier": tier,
+            "kind": item.get("kind") or "chat",
+            "owned_by": item.get("owned_by") or "",
+            "source": source,
+        })
+
+    # 1. 官方标准价目录优先；2. 供应商独有的模型/档位再补进来，保证可选面不缩水
+    for item in apply_aliases_to_catalog(list_official_catalog()):
+        add(item, "official")
+    meta, catalog = get_vendor_catalog(vendor=(vendor or "").strip().lower())
+    if meta:
+        for item in apply_aliases_to_catalog(catalog):
+            add(item, "vendor")
+    models = sorted(rows.values(), key=lambda item: (item["source"] != "official", item["model"], item["service_tier"]))
+    return {
+        "vendor": meta["code"] if meta else "",
+        "count": len(models),
+        "official_count": sum(1 for item in models if item["source"] == "official"),
+        "models": models,
+    }
+
+
 @app.put("/v1/admin/user-model-prices")
 async def admin_upsert_user_model_price(payload: UserModelPriceUpsert, request: Request):
     user, error = await _require_admin(request)
@@ -4126,6 +4707,7 @@ async def admin_upsert_user_model_price(payload: UserModelPriceUpsert, request: 
         return error
     try:
         row = await upsert_user_price(
+            user_ids=payload.user_ids,
             user_id=payload.user_id,
             model=payload.model,
             service_tier=payload.service_tier,

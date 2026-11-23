@@ -683,6 +683,7 @@ async def reload_cache_from_db() -> None:
                 "base_url": vendor.base_url,
                 "api_key": (getattr(vendor, "api_key", None) or "").strip(),
                 "use_proxy": bool(getattr(vendor, "use_proxy", False)),
+                "gemini_native": bool(getattr(vendor, "gemini_native", False)),
                 "keys": keys_by_vendor.get(vendor.id, []),
                 "pricing_url": vendor.pricing_url,
                 "pricing_mode": getattr(vendor, "pricing_mode", None) or PRICING_MODE_MANUAL,
@@ -761,6 +762,8 @@ def get_runtime_upstream(*, vendor: str = "") -> dict:
         "yunxin": code == "yunxin",
         # teamo 一直走代理；其它号商按后台 use_proxy 开关决定
         "use_proxy": code == "teamo" or bool((meta or {}).get("use_proxy")),
+        # 该号商的 Gemini 模型是否只认原生 /v1beta 端点
+        "gemini_native": bool((meta or {}).get("gemini_native")),
         "legacy": code not in {"teamo", "yunxin"},
         "last_synced_at": (meta or {}).get("last_synced_at"),
         "profit_multiplier": (meta or {}).get("profit_multiplier"),
@@ -1180,6 +1183,7 @@ def list_vendors(*, include_pricing_meta: bool = False) -> list[dict]:
             item.pop("profit_multiplier", None)
             item.pop("cost_usd_cny_rate", None)
             item.pop("use_proxy", None)
+            item.pop("gemini_native", None)
             item.pop("keys", None)
         items.append(item)
     return items
@@ -1573,6 +1577,7 @@ async def create_or_update_vendor(
     cost_usd_cny_rate: Optional[float] = None,
     api_key: Optional[str] = None,
     use_proxy: Optional[bool] = None,
+    gemini_native: Optional[bool] = None,
     is_active: bool = True,
     is_default: bool = False,
     sort_order: int = 100,
@@ -1642,6 +1647,10 @@ async def create_or_update_vendor(
             row.use_proxy = bool(use_proxy)
         elif row.id is None:
             row.use_proxy = False
+        if gemini_native is not None:
+            row.gemini_native = bool(gemini_native)
+        elif row.id is None:
+            row.gemini_native = False
         row.is_active = bool(is_active)
         row.sort_order = int(sort_order)
         if is_default:
@@ -1691,6 +1700,7 @@ async def ensure_vendor_schema_columns(conn) -> None:
         "ALTER TABLE tb_upstream_vendor ADD COLUMN profit_multiplier DOUBLE NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN api_key VARCHAR(512) NULL",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN use_proxy TINYINT(1) NOT NULL DEFAULT 0",
+        "ALTER TABLE tb_upstream_vendor ADD COLUMN gemini_native TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE tb_upstream_vendor_key ADD COLUMN protocol VARCHAR(32) NOT NULL DEFAULT ''",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN key_migration_done TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE tb_upstream_vendor ADD COLUMN catalog_policy JSON NULL",

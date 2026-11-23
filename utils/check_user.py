@@ -586,10 +586,13 @@ async def compute_user_token(
         use_teamo_prices = vendor == "teamo"
     else:
         use_teamo_prices = get_runtime_upstream().get("teamo") if use_teamo_prices is None else use_teamo_prices
+    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
+    # 先于价目查询命中，模型不在价目表里也能按专属价扣。
+    user_price = match_user_price(model, user_key=user_id, service_tier=service_tier)
     model_price_raw = lookup_model_price(
         model, teamo=use_teamo_prices, service_tier=service_tier, vendor=vendor,
     )
-    if not model_price_raw:
+    if not model_price_raw and not user_price:
         billing_log.warning(
             "skip req=%s user=%s source=%s model=%s reason=unknown_price in=%s out=%s",
             req_id,
@@ -630,8 +633,6 @@ async def compute_user_token(
     if use_teamo_prices:
         prices = billing_prices
         cache_read_tokens = int(token_dict.get("cache_read_tokens") or 0)
-    # 用户专属价：录入的 USD 价即应付价，人民币只乘汇率，不叠倍率/折扣。
-    user_price = match_user_price(model, user_key=user_id, service_tier=service_tier)
     if user_price:
         prices = resolve_official_prices({
             "input": user_price["input"],
